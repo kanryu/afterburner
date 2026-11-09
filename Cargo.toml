@@ -1,0 +1,46 @@
+[package]
+name = "afterburner"
+version = "0.1.0"
+edition = "2024"
+description = "A Burn-based AI execution engine for training and running LoRA models"
+license = "MIT OR Apache-2.0"
+
+[workspace]
+members = ["crates/afterburner-cli"]
+resolver = "2"
+
+[lib]
+name = "afterburner"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Burn runtime and the crates used by the planned training/inference stack.
+burn = "0.19"
+burn-core = "0.19"
+burn-nn = "0.19"
+burn-autodiff = "0.19"
+burn-optim = "0.19"
+burn-train = "0.19"
+burn-dataset = "0.19"
+burn-store = "0.19"
+burn-cuda = "0.19"
+burn-fusion = "0.19"
+
+# Candle is retained initially as the migration source and numerical oracle.
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+image = "0.25"
+safetensors = "0.7"
+half = "2.7"
+memmap2 = "0.9"
+tokenizers = "0.21"
+
+[features]
+default = []
+cuda = []
+
+[dev-dependencies]
+burn-ndarray = "0.19"
+
