@@ -1,6 +1,6 @@
 //! Burn training-step glue for cached diffusion examples.
 
-use burn::module::{Module, ModuleVisitor, ParamId};
+use burn::module::{Module, ModuleVisitor, Param, ParamId};
 use burn::tensor::{Int, Tensor, TensorData, backend::AutodiffBackend};
 use burn_optim::{GradientsParams, Optimizer};
 
@@ -191,9 +191,40 @@ where
 struct LoraIdCollector {
     target_modules: Vec<String>,
     ids: Vec<ParamId>,
+    path: Vec<String>,
 }
 
 impl<B: burn::tensor::backend::Backend> ModuleVisitor<B> for LoraIdCollector {
+    fn enter_module(&mut self, name: &str, _container_type: &str) {
+        self.path.push(name.to_owned());
+    }
+
+    fn exit_module(&mut self, _name: &str, _container_type: &str) {
+        self.path.pop();
+    }
+
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+        let path = &self.path;
+        let Some(factor) = path.last() else {
+            return;
+        };
+        if factor != "lora_down" && factor != "lora_up" {
+            return;
+        }
+        if path.len() < 3 || path[0] != "blocks" {
+            return;
+        }
+        let module = match path[2..path.len() - 1].join(".").as_str() {
+            "mlp_layer1" => "mlp.layer1".to_owned(),
+            "mlp_layer2" => "mlp.layer2".to_owned(),
+            value => value.to_owned(),
+        };
+        if self.target_modules.iter().any(|target| target == &module) {
+            self.ids.push(param.clone().consume().0);
+        }
+    }
+
+    #[allow(dead_code)]
     fn visit_float_with_path<const D: usize>(
         &mut self,
         path: &[String],
@@ -227,6 +258,7 @@ fn trainable_lora_ids<B: burn::tensor::backend::Backend>(
     let mut collector = LoraIdCollector {
         target_modules: lora.target_modules.clone(),
         ids: Vec::new(),
+        path: Vec::new(),
     };
     model.visit(&mut collector);
     collector.ids

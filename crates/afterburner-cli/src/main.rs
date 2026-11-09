@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize)]
@@ -21,16 +23,70 @@ struct TrainingConfig {
 
 fn candle_device(name: &str, index: usize) -> candle_core::Device {
     if name.eq_ignore_ascii_case("cuda") {
-        match candle_core::Device::new_cuda(index) {
-            Ok(device) => device,
-            Err(error) => {
-                eprintln!("CUDA is unavailable for Candle; falling back to CPU: {error}");
-                candle_core::Device::Cpu
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = index;
+            eprintln!(
+                "CUDA was requested, but the `cuda` feature is disabled; falling back to CPU."
+            );
+            eprintln!("Rebuild with `--features cuda` to enable CUDA.");
+            return candle_core::Device::Cpu;
+        }
+
+        #[cfg(feature = "cuda")]
+        {
+            return match candle_core::Device::new_cuda(index) {
+                Ok(device) => device,
+                Err(error) => {
+                    eprintln!("CUDA is unavailable for Candle; falling back to CPU: {error}");
+                    candle_core::Device::Cpu
+                }
+            };
+        }
+    }
+    candle_core::Device::Cpu
+}
+
+fn resolve_tokenizer_path(
+    explicit: Option<&str>,
+    text_encoder_path: &str,
+    relative_candidates: &[&str],
+    label: &str,
+) -> PathBuf {
+    if let Some(path) = explicit {
+        return PathBuf::from(path);
+    }
+
+    let model_path = Path::new(text_encoder_path);
+    let model_dir = model_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut search_dirs = vec![model_dir.to_path_buf()];
+    search_dirs.push(model_dir.join("tokenizer"));
+    if let Some(parent) = model_dir.parent() {
+        search_dirs.push(parent.to_path_buf());
+        search_dirs.push(parent.join("tokenizer"));
+    }
+    if let Ok(directory) = std::env::var("AFTERBURNER_TOKENIZER_DIR") {
+        search_dirs.insert(0, PathBuf::from(directory));
+    }
+
+    for directory in search_dirs {
+        for relative in relative_candidates {
+            let candidate = directory.join(relative);
+            if candidate.is_file() {
+                eprintln!("auto-selected {label} tokenizer: {}", candidate.display());
+                return candidate;
             }
         }
-    } else {
-        candle_core::Device::Cpu
     }
+
+    eprintln!(
+        "unable to find {label} tokenizer near {}",
+        model_path.display()
+    );
+    eprintln!(
+        "provide the path with the corresponding CLI option or set AFTERBURNER_TOKENIZER_DIR"
+    );
+    std::process::exit(2);
 }
 
 fn main() {
@@ -62,6 +118,7 @@ fn main() {
     let mut flow_matching = false;
     let mut device_name = "cpu".to_owned();
     let mut gpu_index = 0usize;
+    let mut max_resolution = 0_u32;
     let mut config_path = None;
     let mut explicit_train_cache = false;
     let mut explicit_base_model = false;
@@ -183,6 +240,11 @@ fn main() {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);
             explicit_gpu_index = true;
+        } else if argument == "--max-resolution" {
+            max_resolution = args
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
         } else if argument == "--flow-matching" {
             flow_matching = true;
             explicit_flow_matching = true;
@@ -463,6 +525,12 @@ fn main() {
         type BaseBackend = burn_cuda::Cuda;
         #[cfg(not(feature = "cuda"))]
         type BaseBackend = burn_ndarray::NdArray<f32>;
+        #[cfg(feature = "checkpointing")]
+        type TrainBackend = burn_autodiff::Autodiff<
+            BaseBackend,
+            burn_autodiff::checkpoint::strategy::BalancedCheckpointing,
+        >;
+        #[cfg(not(feature = "checkpointing"))]
         type TrainBackend = burn_autodiff::Autodiff<BaseBackend>;
         let device = {
             #[cfg(feature = "cuda")]
@@ -474,6 +542,7 @@ fn main() {
                 <TrainBackend as burn::tensor::backend::Backend>::Device::default()
             }
         };
+        eprintln!("loading Anima base model: {base_model}");
         let (model, load_report) =
             afterburner::load_anima_model::<TrainBackend>(base_model, &lora, &device)
                 .expect("failed to load Anima base model");
@@ -557,17 +626,27 @@ fn main() {
         let vae_path = vae_model
             .as_deref()
             .expect("--preprocess-dataset requires --vae");
-        let tokenizer_path = tokenizer_path
-            .as_deref()
-            .expect("--preprocess-dataset requires --tokenizer");
-        let t5_tokenizer_path = t5_tokenizer_model
-            .as_deref()
-            .expect("--preprocess-dataset requires --t5-tokenizer");
+        let tokenizer_path = resolve_tokenizer_path(
+            tokenizer_path.as_deref(),
+            text_path,
+            &[
+                "tokenizer.json",
+                "qwen_tokenizer/tokenizer.json",
+                "llama_tokenizer/tokenizer.json",
+            ],
+            "Qwen",
+        );
+        let t5_tokenizer_path = resolve_tokenizer_path(
+            t5_tokenizer_model.as_deref(),
+            text_path,
+            &["t5_tokenizer/tokenizer.json", "tokenizer.json"],
+            "T5",
+        );
         let cache_path = output_cache
             .as_deref()
             .expect("--preprocess-dataset requires --output-cache");
         let device = candle_device(&device_name, gpu_index);
-        let tokenizer = afterburner::QwenTokenizer::from_file(tokenizer_path, 512, 151_643)
+        let tokenizer = afterburner::QwenTokenizer::from_file(&tokenizer_path, 512, 151_643)
             .expect("failed to load Qwen tokenizer");
         let text_encoder = afterburner::CandleQwen3TextEncoder::from_safetensors(
             text_path,
@@ -587,8 +666,9 @@ fn main() {
             vae,
             afterburner::QwenImageVaeConfig::default(),
         )
-        .expect("invalid Qwen Image VAE configuration");
-        let t5_tokenizer = afterburner::T5Tokenizer::from_file(t5_tokenizer_path, 512, 0)
+        .expect("invalid Qwen Image VAE configuration")
+        .with_max_dimension((max_resolution > 0).then_some(max_resolution));
+        let t5_tokenizer = afterburner::T5Tokenizer::from_file(&t5_tokenizer_path, 512, 0)
             .expect("failed to load T5 tokenizer");
         let text_encoder = afterburner::AnimaTextEncoder::new(text_encoder, t5_tokenizer);
         let mut preprocessor = afterburner::CompositePreprocessor::new(text_encoder, vae);

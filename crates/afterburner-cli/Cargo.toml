@@ -19,5 +19,6 @@ serde_json = "1"
 
 [features]
 default = []
+checkpointing = ["afterburner/checkpointing"]
 cuda = ["dep:burn-cuda", "afterburner/cuda"]
 

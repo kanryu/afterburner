@@ -19,6 +19,12 @@ use crate::{
     lora::{LoraConfig, LoraLinear, LoraLinearConfig},
 };
 
+/// Upper bound for the query dimension of one attention score matrix.
+///
+/// With checkpointing enabled, the per-chunk operations can be recomputed
+/// during backward instead of retaining every intermediate activation.
+const ATTENTION_QUERY_CHUNK_SIZE: usize = 512;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnimaDiTConfigError {
     Invalid(String),
@@ -402,13 +408,24 @@ impl<B: Backend> AnimaAttention<B> {
         } else {
             (q, k)
         };
-        let mut scores = q
-            .matmul(k.swap_dims(2, 3))
-            .mul_scalar(1.0 / (self.head_size as f32).sqrt());
-        if let Some(mask) = context_mask {
-            scores = scores.add(mask);
+        let key = k.swap_dims(2, 3);
+        let scale = 1.0 / (self.head_size as f32).sqrt();
+        let mut attended_chunks = Vec::new();
+        for query_start in (0..query_length).step_by(ATTENTION_QUERY_CHUNK_SIZE) {
+            let query_end = (query_start + ATTENTION_QUERY_CHUNK_SIZE).min(query_length);
+            let query = q.clone().slice([
+                0..batch,
+                0..self.head_count,
+                query_start..query_end,
+                0..self.head_size,
+            ]);
+            let mut scores = query.matmul(key.clone()).mul_scalar(scale);
+            if let Some(mask) = context_mask.clone() {
+                scores = scores.add(mask);
+            }
+            attended_chunks.push(softmax(scores, 3).matmul(v.clone()));
         }
-        let attended = softmax(scores, 3).matmul(v).swap_dims(1, 2).reshape([
+        let attended = Tensor::cat(attended_chunks, 2).swap_dims(1, 2).reshape([
             batch,
             query_length,
             self.head_count * self.head_size,
@@ -512,8 +529,6 @@ fn apply_rotary_3d<B: Backend>(
         ),
         device,
     );
-    let cos = Tensor::cat(vec![cos_half.clone(), cos_half.clone()], 3);
-    let sin = Tensor::cat(vec![sin_half.clone(), sin_half.clone()], 3);
     let first = input
         .clone()
         .slice([0..batch, 0..heads, 0..sequence_length, 0..half]);
@@ -523,8 +538,8 @@ fn apply_rotary_3d<B: Backend>(
             first
                 .clone()
                 .mul(cos_half.clone())
-                .sub(second.clone().mul(sin_half)),
-            second.mul(cos).add(first.mul(sin)),
+                .sub(second.clone().mul(sin_half.clone())),
+            second.mul(cos_half).add(first.mul(sin_half)),
         ],
         3,
     )
@@ -854,7 +869,9 @@ impl<B: Backend> AnimaDiT<B> {
         config.validate().map_err(AnimaDiTConfigError::Invalid)?;
         lora.validate()
             .map_err(|error| AnimaDiTConfigError::Lora(error.to_string()))?;
-        let block_config = AnimaDiTBlockConfig::from(config);
+        let mut block_config = AnimaDiTBlockConfig::from(config);
+        block_config.lora_rank = lora.rank;
+        block_config.lora_alpha = lora.alpha;
         let mut blocks = Vec::with_capacity(config.block_count);
         for _ in 0..config.block_count {
             blocks.push(AnimaDiTBlock::init(&block_config, device)?);
@@ -1076,6 +1093,25 @@ mod tests {
     }
 
     #[test]
+    fn attention_chunking_preserves_long_sequence_shape() {
+        type Backend = burn_ndarray::NdArray<f32>;
+        let device = <Backend as burn::tensor::backend::Backend>::Device::default();
+        let config = AnimaDiTBlockConfig {
+            hidden_size: 8,
+            context_size: 8,
+            attention_head_count: 2,
+            attention_head_size: 4,
+            mlp_hidden_size: 16,
+            lora_rank: 2,
+            lora_alpha: 2,
+        };
+        let attention = AnimaAttention::<Backend>::init_self(&config, &device).unwrap();
+        let input = Tensor::<Backend, 3>::ones([1, ATTENTION_QUERY_CHUNK_SIZE + 1, 8], &device);
+        let output = attention.forward(input.clone(), input);
+        assert_eq!(output.dims(), [1, ATTENTION_QUERY_CHUNK_SIZE + 1, 8]);
+    }
+
+    #[test]
     fn timestep_embedder_matches_cosmos_condition_shapes() {
         type Backend = burn_ndarray::NdArray<f32>;
         let device = <Backend as burn::tensor::backend::Backend>::Device::default();
@@ -1103,5 +1139,27 @@ mod tests {
         assert_eq!(tokens.dims(), [1, 4, 12]);
         let restored = unpatchify_latent(tokens, 3, 4, 4).unwrap();
         assert_eq!(restored.dims(), [1, 3, 1, 4, 4]);
+    }
+
+    #[test]
+    fn dit_propagates_lora_rank_to_each_block() {
+        type Backend = burn_ndarray::NdArray<f32>;
+        let device = <Backend as burn::tensor::backend::Backend>::Device::default();
+        let mut config = crate::anima::AnimaConfig::default();
+        config.block_count = 1;
+        let lora = crate::lora::LoraConfig {
+            rank: 1,
+            alpha: 1,
+            ..Default::default()
+        };
+        let model = AnimaDiT::<Backend>::init(&config, &lora, &device).unwrap();
+        assert_eq!(
+            model.blocks[0].self_attn.q_proj.lora_down.val().dims(),
+            [1, 2048]
+        );
+        assert_eq!(
+            model.blocks[0].self_attn.q_proj.lora_up.val().dims(),
+            [2048, 1]
+        );
     }
 }

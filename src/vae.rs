@@ -242,18 +242,32 @@ pub trait QwenImageVaeEncoder {
 pub struct QwenImageVaePreprocessor<E> {
     pub encoder: E,
     pub config: QwenImageVaeConfig,
+    max_dimension: Option<u32>,
 }
 
 impl<E> QwenImageVaePreprocessor<E> {
     pub fn new(encoder: E, config: QwenImageVaeConfig) -> Result<Self, VaeError> {
         config.validate().map_err(VaeError::InvalidConfig)?;
-        Ok(Self { encoder, config })
+        Ok(Self {
+            encoder,
+            config,
+            max_dimension: None,
+        })
+    }
+
+    /// Limits the longest image edge before VAE encoding. This keeps the
+    /// resulting DiT token count bounded for full-attention backends.
+    pub fn with_max_dimension(mut self, max_dimension: Option<u32>) -> Self {
+        self.max_dimension = max_dimension.filter(|value| *value > 0);
+        self
     }
 }
 
 impl<E: QwenImageVaeEncoder> ImageVae for QwenImageVaePreprocessor<E> {
     fn encode_image(&mut self, image: &image::RgbImage) -> Result<VaeTensor, PreprocessError> {
-        let input = qwen_image_input(image, &self.config)
+        let image =
+            align_qwen_image_dimensions(image, self.config.spatial_downsample, self.max_dimension);
+        let input = qwen_image_input(&image, &self.config)
             .map_err(|error| PreprocessError::Image(error.to_string()))?;
         let latent = self
             .encoder
@@ -262,6 +276,35 @@ impl<E: QwenImageVaeEncoder> ImageVae for QwenImageVaePreprocessor<E> {
         normalize_qwen_image_latent(&latent, &self.config)
             .map_err(|error| PreprocessError::Encoder(error.to_string()))
     }
+}
+
+fn align_qwen_image_dimensions(
+    image: &image::RgbImage,
+    multiple: usize,
+    max_dimension: Option<u32>,
+) -> image::RgbImage {
+    let (width, height) = match max_dimension {
+        Some(max_dimension) if image.width().max(image.height()) > max_dimension => {
+            let scale = max_dimension as f32 / image.width().max(image.height()) as f32;
+            (
+                ((image.width() as f32 * scale).round() as u32).max(1),
+                ((image.height() as f32 * scale).round() as u32).max(1),
+            )
+        }
+        _ => (image.width(), image.height()),
+    };
+    let multiple = multiple as u32;
+    let aligned_width = (width / multiple).max(1) * multiple;
+    let aligned_height = (height / multiple).max(1) * multiple;
+    if image.width() == aligned_width && image.height() == aligned_height {
+        return image.clone();
+    }
+    image::imageops::resize(
+        image,
+        aligned_width,
+        aligned_height,
+        image::imageops::FilterType::Lanczos3,
+    )
 }
 
 /// Coordinates the data contract between the VAE encoder/decoder and the two
@@ -354,6 +397,26 @@ mod tests {
         let mut preprocessor =
             QwenImageVaePreprocessor::new(IdentityEncoder, QwenImageVaeConfig::default()).unwrap();
         let image = image::RgbImage::from_pixel(8, 8, image::Rgb([0, 0, 0]));
+        let latent = ImageVae::encode_image(&mut preprocessor, &image).unwrap();
+        assert_eq!(latent.shape, vec![1, 16, 1, 1, 1]);
+    }
+
+    #[test]
+    fn qwen_vae_preprocessor_aligns_non_multiple_image_dimensions() {
+        let mut preprocessor =
+            QwenImageVaePreprocessor::new(IdentityEncoder, QwenImageVaeConfig::default()).unwrap();
+        let image = image::RgbImage::from_pixel(1024, 1365, image::Rgb([0, 0, 0]));
+        let latent = ImageVae::encode_image(&mut preprocessor, &image).unwrap();
+        assert_eq!(latent.shape, vec![1, 16, 1, 1, 1]);
+    }
+
+    #[test]
+    fn qwen_vae_preprocessor_can_limit_longest_image_edge() {
+        let mut preprocessor =
+            QwenImageVaePreprocessor::new(IdentityEncoder, QwenImageVaeConfig::default())
+                .unwrap()
+                .with_max_dimension(Some(512));
+        let image = image::RgbImage::from_pixel(1024, 1365, image::Rgb([0, 0, 0]));
         let latent = ImageVae::encode_image(&mut preprocessor, &image).unwrap();
         assert_eq!(latent.shape, vec![1, 16, 1, 1, 1]);
     }

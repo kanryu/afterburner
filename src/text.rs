@@ -231,6 +231,7 @@ impl Qwen3TextConfig {
 /// A Qwen3 encoder backed by Candle and a SafeTensors checkpoint.
 pub struct CandleQwen3TextEncoder<T: CaptionTokenizer> {
     model: qwen3::Model,
+    initial_model: qwen3::Model,
     tokenizer: T,
     device: Device,
     max_tokens: usize,
@@ -258,6 +259,7 @@ impl<T: CaptionTokenizer> CandleQwen3TextEncoder<T> {
         let model = qwen3::Model::new(&config.candle_config(), vb)
             .map_err(|error| PreprocessError::Encoder(error.to_string()))?;
         Ok(Self {
+            initial_model: model.clone(),
             model,
             tokenizer,
             device: device.clone(),
@@ -279,6 +281,11 @@ impl<T: CaptionTokenizer> CandleQwen3TextEncoder<T> {
         }
         let input = Tensor::from_slice(token_ids, (1, token_ids.len()), &self.device)
             .map_err(|error| PreprocessError::Encoder(error.to_string()))?;
+        // Each cache sample is an independent sequence. Candle's Qwen3
+        // implementation keeps a KV cache for incremental decoding but does
+        // not expose a public reset method, so restore the empty model state
+        // before encoding the next caption at offset zero.
+        self.model = self.initial_model.clone();
         let output = self
             .model
             .forward(&input, 0)

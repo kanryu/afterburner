@@ -3,7 +3,7 @@
 use std::{borrow::Cow, collections::HashMap, fs::File, path::Path};
 
 use burn::{
-    module::{Module, ModuleVisitor, Param, ParamId},
+    module::{Module, ModuleVisitor, Param},
     tensor::{Tensor, TensorData, backend::Backend},
 };
 use half::{bf16, f16};
@@ -225,9 +225,13 @@ pub fn load_anima_weights<B: Backend>(
     let tensors = SafeTensors::deserialize(&mapped)
         .map_err(|error| WeightError::SafeTensor(error.to_string()))?;
     let device = model.input_projection.weight.val().device();
+    let show_progress = std::env::var_os("AFTERBURNER_LOAD_PROGRESS").is_some();
     let mut report = AnimaLoadReport::default();
 
-    for (key, view) in tensors.iter() {
+    for (index, (key, view)) in tensors.iter().enumerate() {
+        if show_progress && index % 25 == 0 {
+            eprintln!("loading base tensor {index}: {key}");
+        }
         let Some(slot) = map_anima_weight_key(key) else {
             report.skipped.push(key.to_owned());
             continue;
@@ -663,6 +667,7 @@ struct LoraCollector<B: Backend> {
     tensors: Vec<(String, OwnedTensorView)>,
     error: Option<String>,
     target_modules: Vec<String>,
+    path: Vec<String>,
     marker: std::marker::PhantomData<B>,
 }
 
@@ -672,18 +677,23 @@ impl<B: Backend> LoraCollector<B> {
             tensors: Vec::new(),
             error: None,
             target_modules: lora.target_modules.clone(),
+            path: Vec::new(),
             marker: std::marker::PhantomData,
         }
     }
 }
 
 impl<B: Backend> ModuleVisitor<B> for LoraCollector<B> {
-    fn visit_float_with_path<const D: usize>(
-        &mut self,
-        path: &[String],
-        _id: ParamId,
-        tensor: &Tensor<B, D>,
-    ) {
+    fn enter_module(&mut self, name: &str, _container_type: &str) {
+        self.path.push(name.to_owned());
+    }
+
+    fn exit_module(&mut self, _name: &str, _container_type: &str) {
+        self.path.pop();
+    }
+
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+        let path = &self.path;
         if D != 2 {
             return;
         }
@@ -711,6 +721,7 @@ impl<B: Backend> ModuleVisitor<B> for LoraCollector<B> {
                 .collect::<Vec<_>>()
                 .join(".")
         );
+        let tensor = param.val();
         let data = match tensor.to_data().to_vec::<f32>() {
             Ok(values) => values
                 .iter()
@@ -949,5 +960,28 @@ mod tests {
     fn rejects_weight_shape_mismatch_before_tensor_creation() {
         let error = ensure_shape("layer.weight", &[3, 4], &[2, 4]).unwrap_err();
         assert!(matches!(error, WeightError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn collects_lora_factors_through_burn_visitor_stack() {
+        type Backend = burn_ndarray::NdArray<f32>;
+        let device = <Backend as burn::tensor::backend::Backend>::Device::default();
+        let layer = LoraLinearConfig {
+            input_dim: 4,
+            output_dim: 8,
+            rank: 1,
+            alpha: 1,
+            bias: false,
+        }
+        .init::<Backend>(&device)
+        .unwrap();
+        let mut collector = LoraCollector::<Backend>::new(&LoraConfig::default());
+        collector.enter_module("blocks", "AnimaDiT");
+        collector.enter_module("0", "Vec");
+        collector.enter_module("self_attn", "AnimaAttention");
+        collector.enter_module("q_proj", "LoraLinear");
+        collector.enter_module("lora_down", "Param");
+        collector.visit_float(&layer.lora_down);
+        assert_eq!(collector.tensors.len(), 1);
     }
 }

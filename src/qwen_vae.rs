@@ -280,29 +280,27 @@ impl QwenImageAttention2d {
             .map_err(|error| error.to_string())?;
         let tokens = height * width;
         let qkv = qkv
-            .reshape((batch, 1, self.channels * 3, tokens))
-            .map_err(|error| error.to_string())?
-            .transpose(2, 3)
+            .reshape((batch, self.channels * 3, tokens))
             .map_err(|error| error.to_string())?;
         let query = qkv
-            .narrow(3, 0, self.channels)
+            .narrow(1, 0, self.channels)
             .map_err(|error| error.to_string())?;
         let key = qkv
-            .narrow(3, self.channels, self.channels)
+            .narrow(1, self.channels, self.channels)
             .map_err(|error| error.to_string())?;
         let value = qkv
-            .narrow(3, self.channels * 2, self.channels)
+            .narrow(1, self.channels * 2, self.channels)
             .map_err(|error| error.to_string())?;
         let scores = query
-            .matmul(&key.transpose(2, 3).map_err(|error| error.to_string())?)
+            .transpose(1, 2)
+            .map_err(|error| error.to_string())?
+            .matmul(&key)
             .map_err(|error| error.to_string())?
             .affine(1.0 / (self.channels as f64).sqrt(), 0.0)
             .map_err(|error| error.to_string())?;
         let attended = softmax_last_dim(&scores)
             .map_err(|error| error.to_string())?
-            .matmul(&value)
-            .map_err(|error| error.to_string())?
-            .squeeze(1)
+            .matmul(&value.transpose(1, 2).map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?
             .transpose(1, 2)
             .map_err(|error| error.to_string())?

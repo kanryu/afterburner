@@ -24,7 +24,7 @@ burn-optim = "0.19"
 burn-train = "0.19"
 burn-dataset = "0.19"
 burn-store = "0.19"
-burn-cuda = "0.19"
+burn-cuda = { version = "0.19", optional = true }
 burn-fusion = "0.19"
 
 # Candle is retained initially as the migration source and numerical oracle.
@@ -39,7 +39,12 @@ tokenizers = "0.21"
 
 [features]
 default = []
-cuda = ["candle-core/cuda", "candle-transformers/cuda"]
+checkpointing = []
+cuda = [
+    "dep:burn-cuda",
+    "candle-core/cuda",
+    "candle-transformers/cuda",
+]
 
 [dev-dependencies]
 burn-ndarray = "0.19"
