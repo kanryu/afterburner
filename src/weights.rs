@@ -4,7 +4,7 @@ use std::{borrow::Cow, collections::HashMap, fs::File, path::Path};
 
 use burn::{
     module::{Module, ModuleVisitor, Param},
-    tensor::{Tensor, TensorData, backend::Backend},
+    tensor::{ElementConversion, Tensor, TensorData, backend::Backend},
 };
 use half::{bf16, f16};
 use memmap2::MmapOptions;
@@ -722,9 +722,10 @@ impl<B: Backend> ModuleVisitor<B> for LoraCollector<B> {
                 .join(".")
         );
         let tensor = param.val();
-        let data = match tensor.to_data().to_vec::<f32>() {
+        let data = match tensor.to_data().to_vec::<B::FloatElem>() {
             Ok(values) => values
                 .iter()
+                .map(|value| value.elem::<f32>())
                 .flat_map(|value| value.to_le_bytes())
                 .collect(),
             Err(error) => {

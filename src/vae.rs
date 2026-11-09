@@ -172,7 +172,7 @@ impl VaeTensor {
                     actual: vec![self.shape.len()],
                 })?;
         Ok(Tensor::from_data(
-            TensorData::new(self.data.clone(), shape),
+            TensorData::new(self.data.clone(), shape).convert::<B::FloatElem>(),
             device,
         ))
     }

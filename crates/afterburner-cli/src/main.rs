@@ -521,7 +521,9 @@ fn main() {
         lora.rank = lora_rank;
         lora.alpha = lora_alpha;
         lora.validate().expect("invalid LoRA configuration");
-        #[cfg(feature = "cuda")]
+        #[cfg(all(feature = "cuda", feature = "bf16"))]
+        type BaseBackend = burn_cuda::Cuda<half::bf16>;
+        #[cfg(all(feature = "cuda", not(feature = "bf16")))]
         type BaseBackend = burn_cuda::Cuda;
         #[cfg(not(feature = "cuda"))]
         type BaseBackend = burn_ndarray::NdArray<f32>;

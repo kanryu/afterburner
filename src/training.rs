@@ -1,7 +1,7 @@
 //! Burn training-step glue for cached diffusion examples.
 
 use burn::module::{Module, ModuleVisitor, Param, ParamId};
-use burn::tensor::{Int, Tensor, TensorData, backend::AutodiffBackend};
+use burn::tensor::{ElementConversion, Int, Tensor, TensorData, backend::AutodiffBackend};
 use burn_optim::{GradientsParams, Optimizer};
 
 use crate::{
@@ -492,9 +492,9 @@ where
         let loss = training_loss_with_weighting(&model, &example, loss_weighting)?;
         let values = loss
             .to_data()
-            .to_vec::<f32>()
+            .to_vec::<<B as burn::tensor::backend::Backend>::FloatElem>()
             .map_err(|error| TrainingError::Metrics(format!("{error:?}")))?;
-        last_loss = values.first().copied();
+        last_loss = values.first().map(|value| value.elem::<f32>());
         let loss_value = last_loss.unwrap_or_default();
         logger.info(&format!(
             "steps: {}/{} ({:.0}%), avr_loss={loss_value:.3}",

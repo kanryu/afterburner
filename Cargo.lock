@@ -55,6 +55,7 @@ dependencies = [
  "burn-ndarray",
  "burn-optim",
  "candle-core",
+ "half",
  "image",
  "serde",
  "serde_json",

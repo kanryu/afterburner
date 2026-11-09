@@ -13,6 +13,7 @@ burn-cuda = { version = "0.19", optional = true }
 burn-ndarray = "0.19"
 burn-optim = "0.19"
 candle-core = "0.9"
+half = "2.7"
 image = "0.25"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -20,5 +21,6 @@ serde_json = "1"
 [features]
 default = []
 checkpointing = ["afterburner/checkpointing"]
+bf16 = ["cuda", "afterburner/bf16"]
 cuda = ["dep:burn-cuda", "afterburner/cuda"]
 

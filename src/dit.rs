@@ -453,11 +453,11 @@ fn apply_rotary<B: Backend>(
         }
     }
     let cos = Tensor::from_data(
-        TensorData::new(cos_values, [1, 1, sequence_length, half]),
+        TensorData::new(cos_values, [1, 1, sequence_length, half]).convert::<B::FloatElem>(),
         device,
     );
     let sin = Tensor::from_data(
-        TensorData::new(sin_values, [1, 1, sequence_length, half]),
+        TensorData::new(sin_values, [1, 1, sequence_length, half]).convert::<B::FloatElem>(),
         device,
     );
     let first = input
@@ -516,7 +516,8 @@ fn apply_rotary_3d<B: Backend>(
                 .map(|value| value.cos())
                 .collect::<Vec<_>>(),
             [1, 1, sequence_length, half],
-        ),
+        )
+        .convert::<B::FloatElem>(),
         device,
     );
     let sin_half = Tensor::from_data(
@@ -526,7 +527,8 @@ fn apply_rotary_3d<B: Backend>(
                 .map(|value| value.sin())
                 .collect::<Vec<_>>(),
             [1, 1, sequence_length, half],
-        ),
+        )
+        .convert::<B::FloatElem>(),
         device,
     );
     let first = input

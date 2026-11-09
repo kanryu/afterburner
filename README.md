@@ -40,6 +40,16 @@ cargo build -p afterburner-cli
 cargo build -p afterburner-cli --features cuda
 ```
 
+CUDA training can optionally use the CUDA backend's BF16 element type:
+
+```powershell
+cargo check -p afterburner-cli --features cuda,bf16,checkpointing --offline
+```
+
+BF16 reduces the storage size of model weights and activations, but it can
+change numerical behavior. Validate loss stability and exported LoRA quality
+against the default FP32 path before using it for production runs.
+
 For training with long spatial sequences, enable Burn's balanced checkpointing
 strategy in addition to CUDA. Memory-bound operations are then eligible for
 forward recomputation during backward, reducing activation retention at the

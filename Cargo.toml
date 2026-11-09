@@ -40,6 +40,7 @@ tokenizers = "0.21"
 [features]
 default = []
 checkpointing = []
+bf16 = ["cuda"]
 cuda = [
     "dep:burn-cuda",
     "candle-core/cuda",
