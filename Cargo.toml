@@ -39,7 +39,7 @@ tokenizers = "0.21"
 
 [features]
 default = []
-cuda = []
+cuda = ["candle-core/cuda", "candle-transformers/cuda"]
 
 [dev-dependencies]
 burn-ndarray = "0.19"

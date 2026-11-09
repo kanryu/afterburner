@@ -11,6 +11,26 @@ struct TrainingConfig {
     lora_rank: Option<usize>,
     lora_alpha: Option<usize>,
     flow_matching: Option<bool>,
+    device: Option<String>,
+    gpu_index: Option<usize>,
+    weighting_scheme: Option<String>,
+    max_grad_norm: Option<f32>,
+    checkpoint_every: Option<usize>,
+    checkpoint_prefix: Option<String>,
+}
+
+fn candle_device(name: &str, index: usize) -> candle_core::Device {
+    if name.eq_ignore_ascii_case("cuda") {
+        match candle_core::Device::new_cuda(index) {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("CUDA is unavailable for Candle; falling back to CPU: {error}");
+                candle_core::Device::Cpu
+            }
+        }
+    } else {
+        candle_core::Device::Cpu
+    }
 }
 
 fn main() {
@@ -40,6 +60,8 @@ fn main() {
     let mut checkpoint_prefix = None;
     let mut weighting_scheme = "none".to_owned();
     let mut flow_matching = false;
+    let mut device_name = "cpu".to_owned();
+    let mut gpu_index = 0usize;
     let mut config_path = None;
     let mut explicit_train_cache = false;
     let mut explicit_base_model = false;
@@ -50,6 +72,12 @@ fn main() {
     let mut explicit_lora_rank = false;
     let mut explicit_lora_alpha = false;
     let mut explicit_flow_matching = false;
+    let mut explicit_device = false;
+    let mut explicit_gpu_index = false;
+    let mut explicit_weighting_scheme = false;
+    let mut explicit_max_grad_norm = false;
+    let mut explicit_checkpoint_every = false;
+    let mut explicit_checkpoint_prefix = false;
     let mut output_cache = None;
     let mut text_token_ids = vec![1_u32, 1_u32];
     let mut tokenizer_path = None;
@@ -111,6 +139,7 @@ fn main() {
                 .next()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0.0);
+            explicit_max_grad_norm = true;
         } else if argument == "--seed" {
             seed = args
                 .next()
@@ -134,12 +163,26 @@ fn main() {
                 .next()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);
+            explicit_checkpoint_every = true;
         } else if argument == "--checkpoint-prefix" {
             checkpoint_prefix = args.next();
+            explicit_checkpoint_prefix = true;
         } else if argument == "--weighting-scheme" {
             if let Some(value) = args.next() {
                 weighting_scheme = value;
             }
+            explicit_weighting_scheme = true;
+        } else if argument == "--device" {
+            if let Some(value) = args.next() {
+                device_name = value;
+            }
+            explicit_device = true;
+        } else if argument == "--gpu-index" {
+            gpu_index = args
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            explicit_gpu_index = true;
         } else if argument == "--flow-matching" {
             flow_matching = true;
             explicit_flow_matching = true;
@@ -213,6 +256,34 @@ fn main() {
             if let Some(value) = config.flow_matching {
                 flow_matching = value;
             }
+        }
+        if !explicit_device {
+            if let Some(value) = config.device {
+                device_name = value;
+            }
+        }
+        if !explicit_gpu_index {
+            if let Some(value) = config.gpu_index {
+                gpu_index = value;
+            }
+        }
+        if !explicit_weighting_scheme {
+            if let Some(value) = config.weighting_scheme {
+                weighting_scheme = value;
+            }
+        }
+        if !explicit_max_grad_norm {
+            if let Some(value) = config.max_grad_norm {
+                max_grad_norm = value;
+            }
+        }
+        if !explicit_checkpoint_every {
+            if let Some(value) = config.checkpoint_every {
+                checkpoint_every = value;
+            }
+        }
+        if !explicit_checkpoint_prefix {
+            checkpoint_prefix = config.checkpoint_prefix;
         }
     }
 
@@ -291,7 +362,7 @@ fn main() {
         println!("cache_tensor_bytes={}", cache.total_tensor_bytes());
     }
     if let Some(path) = inspect_text_encoder.clone() {
-        let device = candle_core::Device::Cpu;
+        let device = candle_device(&device_name, gpu_index);
         if let Some(tokenizer_path) = tokenizer_path.clone() {
             let tokenizer = afterburner::QwenTokenizer::from_file(tokenizer_path, 512, 151_643)
                 .expect("failed to load Qwen tokenizer");
@@ -341,7 +412,7 @@ fn main() {
         }
     }
     if let Some(path) = inspect_vae_stem.clone() {
-        let device = candle_core::Device::Cpu;
+        let device = candle_device(&device_name, gpu_index);
         let stem = afterburner::CandleQwenImageVaeStem::from_safetensors(
             path,
             candle_core::DType::F32,
@@ -388,9 +459,21 @@ fn main() {
         lora.rank = lora_rank;
         lora.alpha = lora_alpha;
         lora.validate().expect("invalid LoRA configuration");
+        #[cfg(feature = "cuda")]
+        type BaseBackend = burn_cuda::Cuda;
+        #[cfg(not(feature = "cuda"))]
         type BaseBackend = burn_ndarray::NdArray<f32>;
         type TrainBackend = burn_autodiff::Autodiff<BaseBackend>;
-        let device = <TrainBackend as burn::tensor::backend::Backend>::Device::default();
+        let device = {
+            #[cfg(feature = "cuda")]
+            {
+                burn_cuda::CudaDevice::new(gpu_index)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                <TrainBackend as burn::tensor::backend::Backend>::Device::default()
+            }
+        };
         let (model, load_report) =
             afterburner::load_anima_model::<TrainBackend>(base_model, &lora, &device)
                 .expect("failed to load Anima base model");
@@ -483,7 +566,7 @@ fn main() {
         let cache_path = output_cache
             .as_deref()
             .expect("--preprocess-dataset requires --output-cache");
-        let device = candle_core::Device::Cpu;
+        let device = candle_device(&device_name, gpu_index);
         let tokenizer = afterburner::QwenTokenizer::from_file(tokenizer_path, 512, 151_643)
             .expect("failed to load Qwen tokenizer");
         let text_encoder = afterburner::CandleQwen3TextEncoder::from_safetensors(
