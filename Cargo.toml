@@ -9,6 +9,12 @@ license = "MIT OR Apache-2.0"
 members = ["crates/afterburner-cli"]
 resolver = "2"
 
+[patch.crates-io]
+# Afterburner needs memory-bound MatMul recomputation for long DiT graphs.
+# Burn 0.19 does not expose this hook from the published crate, so the
+# narrowly-scoped local fork is used by both the library and CLI.
+burn-autodiff = { path = "vendor/burn-autodiff" }
+
 [lib]
 name = "afterburner"
 path = "src/lib.rs"
@@ -27,6 +33,7 @@ burn-store = "0.19"
 burn-cuda = { version = "0.19", optional = true }
 cubecl-core = { version = "0.8.1", optional = true }
 cubecl-cuda = { version = "0.8.1", optional = true }
+cubecl-runtime = { version = "0.8.1", optional = true }
 burn-fusion = "0.19"
 
 # Candle is retained initially as the migration source and numerical oracle.
@@ -48,8 +55,19 @@ cuda = [
     "dep:burn-cuda",
     "dep:cubecl-core",
     "dep:cubecl-cuda",
+]
+# Enable Candle's CUDA kernels only when GPU preprocessing is requested.
+# Burn CUDA training does not require this feature when reading AFBCACHE.
+candle-cuda = [
     "candle-core/cuda",
     "candle-transformers/cuda",
+]
+# Use CubeCL's exclusive-page pools instead of sub-slice pools for long
+# training runs. This reduces fragmentation and makes allocator growth easier
+# to bound on CUDA devices.
+fixed-memory = [
+    "dep:cubecl-runtime",
+    "cubecl-runtime/exclusive-memory-only",
 ]
 
 [dev-dependencies]

@@ -182,9 +182,15 @@ where
     B: AutodiffBackend,
     O: Optimizer<AnimaDiT<B>, B>,
 {
-    let mut gradients = loss.backward();
-    let ids = trainable_lora_ids(&model, lora);
-    let gradients = GradientsParams::from_params(&mut gradients, &model, &ids);
+    // Keep the full autodiff gradient container alive only while extracting
+    // the configured LoRA gradients. Retaining it through `optimizer.step`
+    // keeps non-trainable graph buffers reachable across step boundaries on
+    // CUDA and causes a nearly constant VRAM increase on every update.
+    let gradients = {
+        let mut all_gradients = loss.backward();
+        let ids = trainable_lora_ids(&model, lora);
+        GradientsParams::from_params(&mut all_gradients, &model, &ids)
+    };
     optimizer.step(learning_rate, model, gradients)
 }
 
@@ -578,6 +584,7 @@ where
         return Err(TrainingError::EmptyCache);
     }
     cache.validate_anima_shapes()?;
+    let device = model.input_projection.weight.val().device();
     logger.info("Network train mode: UNet-only (text encoder not trained; cached inputs only).");
     logger.info(&format!(
         "running training / 学習開始\n  num train images * repeats: {}\n  batch size per device: 1\n  total optimization steps: {}",
@@ -585,6 +592,9 @@ where
     ));
     let mut rng = seed;
     let mut last_loss = None;
+    let debug_param_ids = std::env::var_os("AFTERBURNER_DEBUG_PARAM_IDS").is_some();
+    let memory_trace = std::env::var_os("AFTERBURNER_MEMORY_TRACE").is_some();
+    let mut previous_param_ids = None::<Vec<ParamId>>;
     for step in 0..steps {
         let sample = cache
             .get(step % cache.len())
@@ -613,6 +623,9 @@ where
             TrainingExample::from_cache_with_target(sample, schedule, timestep, noise, target_kind)
         }
         .map_err(|error| TrainingError::Vae(error.to_string()))?;
+        if memory_trace {
+            logger.info(&format!("[memory-phase] step={} phase=forward_begin", step + 1));
+        }
         if std::env::var_os("AFTERBURNER_DEBUG_FORWARD").is_some() {
             logger.info(&format!(
                 "[debug] sample={} latent={:?} text={:?} timestep={:?} adapter_ids={}",
@@ -624,6 +637,9 @@ where
             ));
         }
         let loss = training_loss_with_weighting(&model, &example, loss_weighting)?;
+        if memory_trace {
+            logger.info(&format!("[memory-phase] step={} phase=forward_loss_complete", step + 1));
+        }
         if std::env::var_os("AFTERBURNER_DEBUG_FORWARD").is_some() {
             logger.info("[debug] loss forward complete");
         }
@@ -634,15 +650,60 @@ where
         last_loss = values.first().map(|value| value.elem::<f32>());
         let loss_value = last_loss.unwrap_or_default();
         let effective_learning_rate = learning_rate_policy.learning_rate(step);
+        if debug_param_ids {
+            let ids = trainable_lora_ids(&model, &lora);
+            let changed = previous_param_ids
+                .as_ref()
+                .map(|previous| {
+                    previous.len() != ids.len()
+                        || previous.iter().zip(&ids).any(|(old, new)| old != new)
+                })
+                .unwrap_or(false);
+            let first = ids.first().map(ParamId::val);
+            let last = ids.last().map(ParamId::val);
+            logger.info(&format!(
+                "[param-id] step={} count={} changed={} first={first:?} last={last:?}",
+                step + 1,
+                ids.len(),
+                changed
+            ));
+            previous_param_ids = Some(ids);
+        }
         logger.info(&format!(
             "steps: {}/{} ({:.0}%), avr_loss={loss_value:.3}, lr={effective_learning_rate:.3e}",
             step + 1,
             steps,
             ((step + 1) as f32 / steps.max(1) as f32) * 100.0
         ));
-        model = optimizer_step_with_config(optimizer, model, loss, effective_learning_rate, &lora);
+        let optimizer_started = std::time::Instant::now();
+        if memory_trace {
+            logger.info(&format!("[memory-phase] step={} phase=backward_optimizer_begin", step + 1));
+        }
         if std::env::var_os("AFTERBURNER_DEBUG_FORWARD").is_some() {
-            logger.info("[debug] optimizer step complete");
+            logger.info("[debug] backward and optimizer started");
+        }
+        model = optimizer_step_with_config(optimizer, model, loss, effective_learning_rate, &lora);
+        // Match the step-boundary cleanup used by the reference PyTorch
+        // trainer. This gives the backend a chance to release allocator-managed
+        // buffers that are no longer reachable after backward. It cannot force
+        // the allocator to return pages that still have live tensor handles.
+        drop(example);
+        // Ensure asynchronous CUDA work has completed before asking the
+        // backend allocator to reclaim transient buffers. Without the sync,
+        // the allocator can report one step's activation workspace as still
+        // live and appear to grow monotonically.
+        B::sync(&device);
+        if std::env::var_os("AFTERBURNER_DISABLE_MEMORY_CLEANUP").is_none() {
+            B::memory_cleanup(&device);
+        }
+        if memory_trace {
+            logger.info(&format!("[memory-phase] step={} phase=step_cleanup_complete", step + 1));
+        }
+        if std::env::var_os("AFTERBURNER_DEBUG_FORWARD").is_some() {
+            logger.info(&format!(
+                "[debug] optimizer step complete in {:.3}s",
+                optimizer_started.elapsed().as_secs_f64()
+            ));
         }
         if let (Some(interval), Some(callback)) = (checkpoint_every, checkpoint.as_mut()) {
             if interval > 0 && (step + 1) % interval == 0 {
@@ -689,6 +750,10 @@ fn gaussian_like(shape: &[usize], state: &mut u64) -> Result<crate::vae::VaeTens
 
 #[cfg(test)]
 mod tests {
+    use burn::tensor::{Tensor, TensorData};
+    use burn_autodiff::{Autodiff, checkpoint::strategy::BalancedCheckpointing};
+    use burn_ndarray::NdArray;
+
     use crate::diffusion::timestep_embedding;
 
     #[test]
@@ -696,5 +761,37 @@ mod tests {
         let features = timestep_embedding(10, 100, 2048);
         assert_eq!(features.shape, vec![1, 2048]);
         assert!(features.data.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn memory_bound_matmul_recomputes_without_changing_gradients() {
+        type Backend = Autodiff<NdArray<f32>, BalancedCheckpointing>;
+        let device = Default::default();
+        let lhs = Tensor::<Backend, 2>::from_data(
+            TensorData::new(vec![1.0_f32, 2.0, 3.0, 4.0], [2, 2]),
+            &device,
+        )
+        .require_grad();
+        let rhs = Tensor::<Backend, 2>::from_data(
+            TensorData::new(vec![5.0_f32, 6.0, 7.0, 8.0], [2, 2]),
+            &device,
+        )
+        .require_grad();
+        let loss = lhs.clone().matmul(rhs.clone()).sum();
+        let gradients = loss.backward();
+        let lhs_grad = lhs
+            .grad(&gradients)
+            .expect("missing lhs gradient")
+            .to_data()
+            .to_vec::<f32>()
+            .expect("invalid lhs gradient data");
+        let rhs_grad = rhs
+            .grad(&gradients)
+            .expect("missing rhs gradient")
+            .to_data()
+            .to_vec::<f32>()
+            .expect("invalid rhs gradient data");
+        assert_eq!(lhs_grad, vec![11.0, 15.0, 11.0, 15.0]);
+        assert_eq!(rhs_grad, vec![4.0, 4.0, 6.0, 6.0]);
     }
 }

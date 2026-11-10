@@ -39,6 +39,7 @@ dependencies = [
  "candle-transformers",
  "cubecl-core",
  "cubecl-cuda",
+ "cubecl-runtime",
  "half",
  "image",
  "memmap2",
@@ -468,8 +469,6 @@ dependencies = [
 [[package]]
 name = "burn-autodiff"
 version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "917423a74bf4d39f17a6799089869648e3d2b6ac89d93901aab4aeb9a7f82138"
 dependencies = [
  "burn-common",
  "burn-tensor",

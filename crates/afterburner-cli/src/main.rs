@@ -7,6 +7,7 @@ struct TrainingConfig {
     train_cache: Option<String>,
     base_model: Option<String>,
     output_lora: Option<String>,
+    epochs: Option<usize>,
     steps: Option<usize>,
     learning_rate: Option<f64>,
     lr_schedule: Option<String>,
@@ -127,17 +128,17 @@ fn print_memory_preflight(preflight: MemoryPreflight) {
 
 fn candle_device(name: &str, index: usize) -> candle_core::Device {
     if name.eq_ignore_ascii_case("cuda") {
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "candle-cuda"))]
         {
             let _ = index;
             eprintln!(
-                "CUDA was requested, but the `cuda` feature is disabled; falling back to CPU."
+                "Candle CUDA was requested, but the `candle-cuda` feature is disabled; falling back to CPU."
             );
-            eprintln!("Rebuild with `--features cuda` to enable CUDA.");
+            eprintln!("Rebuild with `--features candle-cuda` to enable Candle CUDA preprocessing.");
             return candle_core::Device::Cpu;
         }
 
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "candle-cuda")]
         {
             return match candle_core::Device::new_cuda(index) {
                 Ok(device) => device,
@@ -228,13 +229,17 @@ fn run() {
     let mut base_model = None;
     let mut output_lora = None;
     let mut train_steps = 0usize;
+    let mut max_optimization_steps = None::<usize>;
     let mut learning_rate = 1e-4_f64;
     let mut lr_schedule = "warmup_cosine".to_owned();
     let mut lr_warmup_steps = None::<usize>;
     let mut lr_min = None::<f64>;
     let mut max_grad_norm = 0.0_f32;
     let mut seed = 42_u64;
-    let mut lora_rank = 16usize;
+    // Match the practical kohya_ss/Anima baseline. Higher ranks remain
+    // available through --lora-rank, but rank 8 keeps the default adapter
+    // size and optimizer state within the intended 16 GiB class.
+    let mut lora_rank = 8usize;
     let mut lora_alpha = 16usize;
     #[cfg(feature = "bf16")]
     let mut lora_dtype = "bf16".to_owned();
@@ -319,6 +324,14 @@ fn run() {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);
             explicit_steps = true;
+        } else if argument == "--epochs" {
+            train_steps = args
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            explicit_steps = true;
+        } else if argument == "--max-optimization-steps" {
+            max_optimization_steps = args.next().and_then(|value| value.parse().ok());
         } else if argument == "--learning-rate" {
             learning_rate = args
                 .next()
@@ -446,7 +459,7 @@ fn run() {
             output_lora = config.output_lora;
         }
         if !explicit_steps {
-            if let Some(value) = config.steps {
+            if let Some(value) = config.epochs.or(config.steps) {
                 train_steps = value;
             }
         }
@@ -685,7 +698,7 @@ fn run() {
             .as_deref()
             .expect("--train-cache requires --output-lora");
         if train_steps == 0 {
-            eprintln!("--steps must be greater than zero");
+            eprintln!("--epochs must be greater than zero");
             std::process::exit(2);
         }
         eprintln!("[load] loading training cache: {cache_path}");
@@ -696,9 +709,21 @@ fn run() {
         });
         eprintln!("[load] training cache loaded: samples={}", cache.len());
         let training_epochs = train_steps;
-        let optimization_steps = training_epochs
+        let full_optimization_steps = training_epochs
             .checked_mul(cache.len())
             .expect("--steps multiplied by cache size overflows");
+        let optimization_steps = max_optimization_steps
+            .map(|limit| limit.min(full_optimization_steps))
+            .unwrap_or(full_optimization_steps);
+        if optimization_steps == 0 {
+            eprintln!("--max-optimization-steps must be greater than zero");
+            std::process::exit(2);
+        }
+        if optimization_steps != full_optimization_steps {
+            eprintln!(
+                "optimization_step_limit={optimization_steps} (full_run={full_optimization_steps})"
+            );
+        }
         let mut lora = afterburner::LoraConfig::default();
         lora.rank = lora_rank;
         lora.alpha = lora_alpha;
@@ -897,15 +922,35 @@ fn run() {
             .filter(|value| *value > 0)
             .unwrap_or(10);
         #[cfg(feature = "cuda")]
+        let runtime_memory_budget_bytes =
+            memory_budget_gb.map(|value| (value * 1024.0_f64.powi(3)).min(u64::MAX as f64) as u64);
+        #[cfg(feature = "cuda")]
+        let mut previous_memory_in_use = None::<u64>;
+        #[cfg(feature = "cuda")]
         let mut memory_hook = |step: usize| {
-            memory_client.memory_cleanup();
+            if std::env::var_os("AFTERBURNER_DISABLE_MEMORY_CLEANUP").is_none() {
+                memory_client.memory_cleanup();
+            }
+            let usage = memory_client.memory_usage();
+            if let Some(budget_bytes) = runtime_memory_budget_bytes {
+                if usage.bytes_reserved > budget_bytes {
+                    eprintln!(
+                        "memory budget exceeded at optimizer step {step}: reserved={} budget={budget_bytes}; stopping before further allocations",
+                        usage.bytes_reserved
+                    );
+                    std::process::exit(3);
+                }
+            }
             if step % memory_log_every == 0 || step == 1 {
-                let usage = memory_client.memory_usage();
+                let delta = previous_memory_in_use
+                    .map(|previous| usage.bytes_in_use.saturating_sub(previous))
+                    .unwrap_or(0);
                 eprintln!(
-                    "[memory] step={step}: in_use={} reserved={} allocations={}",
-                    usage.bytes_in_use, usage.bytes_reserved, usage.number_allocs
+                    "[memory] step={step}: in_use={} reserved={} delta_in_use={} allocations={}",
+                    usage.bytes_in_use, usage.bytes_reserved, delta, usage.number_allocs
                 );
             }
+            previous_memory_in_use = Some(usage.bytes_in_use);
         };
         #[cfg(feature = "cuda")]
         let memory_hook: Option<&mut dyn FnMut(usize)> = Some(&mut memory_hook);

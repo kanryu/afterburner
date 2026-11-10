@@ -5,11 +5,25 @@ training and exporting LoRA adapters for image-generation models. It uses Burn
 for diffusion-transformer training and Candle for text-encoder and VAE
 preprocessing.
 
+## CubeCL memory tracing
+
+The repository includes `cubecl.toml` with compact CubeCL memory logging
+enabled. CUDA runs report new memory-page events to stderr, while Afterburner
+step markers identify the training phase. For a raw allocation trace, copy
+`cubecl-trace.toml` to `cubecl.toml`, run the workload with
+`AFTERBURNER_MEMORY_TRACE=1`, and summarize the result with:
+
+```powershell
+.\tools\filter-cubecl-memory-log.ps1 `
+  -InputPath .\training.log `
+  -OutputPath .\training-memory-summary.txt
+```
+
 ## GPU build
 
 On Windows, use the MSVC Rust toolchain from a Visual Studio Developer Command
-Prompt. The CUDA feature enables both Burn CUDA training and Candle CUDA
-preprocessing:
+Prompt. The `cuda` feature enables Burn CUDA training. Candle CUDA
+preprocessing is separate and requires `candle-cuda`:
 
 ```powershell
 cargo check -p afterburner-cli --features cuda --offline
@@ -24,13 +38,14 @@ cargo run -p afterburner-cli --features cuda --offline -- `
   --inspect-vae-stem C:\\models\\qwen_image_vae.safetensors
 ```
 
-Without `--features cuda`, training uses the CPU NdArray backend. If Candle
-cannot initialize the requested CUDA device, preprocessing reports the error
+Without `--features cuda`, training uses the CPU NdArray backend. If
+`--device cuda` is used without `candle-cuda`, preprocessing falls back to CPU.
+If Candle cannot initialize the requested CUDA device, preprocessing reports the error
 and falls back to CPU. If `--device cuda` is used without the feature, the
 CLI also reports that CUDA is disabled and uses CPU explicitly.
 
-CUDA is therefore opt-in for both the Burn training backend and Candle
-preprocessing:
+Burn CUDA training and Candle CUDA preprocessing are independent opt-in
+features:
 
 ```powershell
 # Default CPU build
@@ -46,6 +61,17 @@ CUDA training can optionally use the CUDA backend's BF16 element type:
 cargo check -p afterburner-cli --features cuda,bf16,checkpointing --offline
 ```
 
+For CUDA runs where allocator fragmentation must be minimized, the optional
+`fixed-memory` feature selects CubeCL's exclusive-page pools:
+
+```powershell
+cargo build -p afterburner-cli --release --features cuda,bf16,fixed-memory --offline
+```
+
+This reduces reserved-pool overhead, but it cannot reclaim tensors that remain
+live in the training graph. A stable `in_use` value across optimizer updates is
+still required.
+
 BF16 reduces the storage size of model weights and activations, but it can
 change numerical behavior. Validate loss stability and exported LoRA quality
 against the default FP32 path before using it for production runs.
@@ -59,17 +85,20 @@ cargo check -p afterburner-cli --features vulkan,checkpointing --offline
 cargo run -p afterburner-cli --features vulkan,checkpointing -- `
   --device vulkan --train-cache dataset.afbcache `
   --base-model anima.safetensors --output-lora afterburner-lora.safetensors `
-  --steps 1
+  --epochs 1
 ```
 
 When `--device vulkan` is selected, Burn training uses Vulkan while Candle
 preprocessing remains on CPU because Candle's preprocessing path currently
 supports CPU and CUDA devices.
 
-The CLI interprets `--steps` as the number of dataset epochs, matching the
+The CLI interprets `--epochs` as the number of dataset epochs, matching the
 kohya_ss workflow. One epoch visits every expanded cache sample once, so a
-dataset cache with 270 samples and `--steps 10` performs 2,700 optimizer
-steps. The effective count is printed as `training_steps`.
+dataset cache with 270 samples and `--epochs 10` performs 2,700 optimizer
+updates. `--steps` remains accepted as a backwards-compatible alias. The
+effective update count is printed as `training_steps`.
+For a short backend smoke test, `--max-optimization-steps 1` caps the actual
+optimizer updates without changing the meaning of `--epochs` for normal runs.
 
 The default optimizer policy is `warmup_cosine`: the learning rate warms up
 for 10% of the optimization steps, then decays cosinely to 10% of the peak.
@@ -82,11 +111,26 @@ The default follows the compiled training backend: `bf16` builds default to
 BF16 output and other builds default to F32. Pre-quantized base tensors such
 as INT8/INT4 remain in their original representation and are never widened
 or rewritten just to match the LoRA dtype.
+The CLI default is `lora_rank=8` and `lora_alpha=16`, matching the practical
+Anima training baseline. Use `--lora-rank` explicitly for larger adapters.
 
 For training with long spatial sequences, enable Burn's balanced checkpointing
 strategy in addition to CUDA. Memory-bound operations are then eligible for
 forward recomputation during backward, reducing activation retention at the
 cost of extra compute:
+
+This is not equivalent to kohya_ss's explicit per-DiT-block checkpointing.
+Burn 0.19 classifies the dominant matrix multiplications as compute-bound, so
+the current feature does not discard and recompute an entire Anima block.
+Treat memory preflight and attention chunking as safety measures until a
+block-level checkpoint operation or backend-native memory-efficient attention
+kernel is available.
+
+Afterburner now uses a narrowly scoped local `burn-autodiff` fork. Its float
+MatMul operation is marked memory-bound and receives a retro-forward, allowing
+Burn's balanced checkpointing strategy to recompute MatMul inputs during
+backward. This reduces retained MatMul intermediates without detaching the
+gradient path. Full DiT-block checkpointing remains a separate follow-up.
 
 ```powershell
 cargo run -p afterburner-cli --features cuda,checkpointing -- `
@@ -135,10 +179,10 @@ optional):
   "train_cache": "dataset.afbcache",
   "base_model": "anima-aesthetic-v1.1.safetensors",
   "output_lora": "afterburner-lora.safetensors",
-  "steps": 1000,
+  "epochs": 10,
   "learning_rate": 0.0001,
   "seed": 42,
-  "lora_rank": 16,
+  "lora_rank": 8,
   "lora_alpha": 16,
   "flow_matching": true,
   "device": "cuda",

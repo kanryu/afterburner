@@ -1,0 +1,9 @@
+# Copy this file to cubecl.toml for a raw CubeCL allocation trace.
+# The full logger is intentionally opt-in because it prints the complete pool
+# report for every new page and can generate very large logs.
+[streaming]
+max_streams = 1
+
+[memory.logger]
+level = "full"
+stderr = true

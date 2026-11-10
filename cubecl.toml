@@ -1,0 +1,10 @@
+# Diagnostic CubeCL configuration for Afterburner.
+# The memory logger reports reservation and new-page events with allocation
+# sizes. Keep max_streams explicit because stream-dependent pool behavior is
+# relevant to long-running training runs.
+[streaming]
+max_streams = 1
+
+[memory.logger]
+level = "disabled"
+stderr = true

@@ -435,8 +435,13 @@ impl<B: Backend> AnimaAttention<B> {
             // Keep attention tensors in the backend dtype, but evaluate the
             // numerically sensitive softmax normalization in F32. This is
             // required by some Vulkan BF16 shader paths.
-            let attended = softmax(scores.clone().cast(DType::F32), 3)
-                .cast(scores.dtype())
+            // Capture the dtype before consuming `scores`. Cloning here would
+            // keep an additional score node alive in the autodiff graph for
+            // every query chunk, which is especially expensive for DiT
+            // self-attention.
+            let scores_dtype = scores.dtype();
+            let attended = softmax(scores.cast(DType::F32), 3)
+                .cast(scores_dtype)
                 .matmul(v.clone());
             attended_chunks.push(attended);
         }
