@@ -118,22 +118,27 @@ impl LoraLinearConfig {
                 "alpha must be greater than zero".into(),
             ));
         }
-        let initializer = Initializer::KaimingUniform {
+        let lora_initializer = Initializer::KaimingUniform {
             gain: 1.0 / 3.0_f64.sqrt(),
             fan_out_only: false,
         };
+        // Base weights are populated immediately from SafeTensors by the
+        // model loader. Avoid launching random-generation kernels for the
+        // multi-billion-parameter base model on GPU backends; only the
+        // trainable LoRA branch needs a random initialization here.
+        let base_initializer = Initializer::Zeros;
         let bias = self
             .bias
             .then(|| Initializer::Zeros.init([self.output_dim], device));
         Ok(LoraLinear {
-            weight: initializer.init_with(
+            weight: base_initializer.init_with(
                 [self.output_dim, self.input_dim],
                 Some(self.input_dim),
                 Some(self.output_dim),
                 device,
             ),
             bias,
-            lora_down: initializer.init_with(
+            lora_down: lora_initializer.init_with(
                 [self.rank, self.input_dim],
                 Some(self.input_dim),
                 Some(self.rank),
@@ -194,14 +199,17 @@ pub fn select_anima_target(
     config: &LoraConfig,
 ) -> Result<Option<LoraTarget>, LoraError> {
     config.validate()?;
-    if !key.contains("model.diffusion_model.blocks.")
-        || key.contains("llm_adapter")
-        || !key.ends_with(".weight")
-    {
+    let key = key
+        .strip_prefix("model.diffusion_model.")
+        .or_else(|| key.strip_prefix("net."));
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    if !key.starts_with("blocks.") || key.contains("llm_adapter") || !key.ends_with(".weight") {
         return Ok(None);
     }
     let module = key
-        .strip_prefix("model.diffusion_model.blocks.")
+        .strip_prefix("blocks.")
         .and_then(|value| value.split_once('.'))
         .and_then(|(_, value)| value.strip_suffix(".weight"));
     let Some(module) = module else {
@@ -229,6 +237,9 @@ pub fn select_anima_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn::module::Param;
+    use burn_autodiff::Autodiff;
+    use burn_optim::{AdamConfig, GradientsParams, Optimizer};
 
     #[test]
     fn selects_anima_self_attention_target() {
@@ -242,6 +253,18 @@ mod tests {
         assert_eq!(target.rank, 16);
         assert_eq!(target.parameter_count(), 65_536);
         assert_eq!(target.scale(), 1.0);
+    }
+
+    #[test]
+    fn selects_anima_target_from_native_net_checkpoint_key() {
+        let target = select_anima_target(
+            "net.blocks.0.mlp.layer1.weight",
+            &[8192, 2048],
+            &LoraConfig::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!((target.output_dim, target.input_dim), (8192, 2048));
     }
 
     #[test]
@@ -304,5 +327,29 @@ mod tests {
                 .iter()
                 .all(|value| *value == 0.0)
         );
+    }
+
+    #[test]
+    fn burn_lora_linear_updates_zero_initialized_up_factor() {
+        type Backend = Autodiff<burn_ndarray::NdArray<f32>>;
+        let device = Default::default();
+        let layer = LoraLinearConfig {
+            input_dim: 4,
+            output_dim: 3,
+            rank: 2,
+            alpha: 2,
+            bias: false,
+        }
+        .init::<Backend>(&device)
+        .unwrap();
+        let mut layer = layer;
+        layer.weight = Param::from_tensor(Tensor::<Backend, 2>::ones([3, 4], &device));
+        let input = Tensor::<Backend, 2>::ones([2, 4], &device);
+        let loss = layer.forward(input).square().mean();
+        let mut optimizer = AdamConfig::new().init::<Backend, LoraLinear<Backend>>();
+        let grads = GradientsParams::from_grads(loss.backward(), &layer);
+        let updated = optimizer.step(1.0e-2, layer, grads);
+        let up = updated.lora_up.val().into_data().to_vec::<f32>().unwrap();
+        assert!(up.iter().any(|value| *value != 0.0));
     }
 }

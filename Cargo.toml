@@ -25,6 +25,8 @@ burn-train = "0.19"
 burn-dataset = "0.19"
 burn-store = "0.19"
 burn-cuda = { version = "0.19", optional = true }
+cubecl-core = { version = "0.8.1", optional = true }
+cubecl-cuda = { version = "0.8.1", optional = true }
 burn-fusion = "0.19"
 
 # Candle is retained initially as the migration source and numerical oracle.
@@ -40,9 +42,12 @@ tokenizers = "0.21"
 [features]
 default = []
 checkpointing = []
-bf16 = ["cuda"]
+bf16 = []
+vulkan = ["burn/vulkan"]
 cuda = [
     "dep:burn-cuda",
+    "dep:cubecl-core",
+    "dep:cubecl-cuda",
     "candle-core/cuda",
     "candle-transformers/cuda",
 ]

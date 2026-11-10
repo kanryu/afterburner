@@ -1,6 +1,10 @@
 //! Model-type registry and configuration dispatch.
 
-use std::{fmt, str::FromStr};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use crate::anima::AnimaConfig;
 
@@ -45,6 +49,7 @@ impl FromStr for ModelType {
 pub enum ModelError {
     UnknownType(String),
     InvalidConfig(String),
+    MissingFileName(String),
 }
 
 impl fmt::Display for ModelError {
@@ -52,11 +57,76 @@ impl fmt::Display for ModelError {
         match self {
             Self::UnknownType(value) => write!(f, "unknown model type: {value}"),
             Self::InvalidConfig(message) => write!(f, "invalid model configuration: {message}"),
+            Self::MissingFileName(path) => write!(f, "model path has no file name: {path}"),
         }
     }
 }
 
 impl std::error::Error for ModelError {}
+
+/// Stable cache identity for a model component set.
+///
+/// The identity intentionally uses file names rather than absolute paths so
+/// that the same model bundle can share a cache across installations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelCacheKey {
+    pub model_type: ModelType,
+    pub diffusion_model: String,
+    pub text_encoder: String,
+    pub vae: String,
+}
+
+impl ModelCacheKey {
+    pub fn from_paths(
+        model_type: ModelType,
+        diffusion_model: impl AsRef<Path>,
+        text_encoder: impl AsRef<Path>,
+        vae: impl AsRef<Path>,
+    ) -> Result<Self, ModelError> {
+        Ok(Self {
+            model_type,
+            diffusion_model: file_name(diffusion_model.as_ref())?,
+            text_encoder: file_name(text_encoder.as_ref())?,
+            vae: file_name(vae.as_ref())?,
+        })
+    }
+
+    /// Returns a filesystem-safe, deterministic cache file name.
+    pub fn file_name(&self) -> String {
+        format!(
+            "{}--{}--{}--{}.afbcache",
+            self.model_type,
+            cache_component(&self.diffusion_model),
+            cache_component(&self.text_encoder),
+            cache_component(&self.vae),
+        )
+    }
+
+    pub fn path_in(&self, directory: impl AsRef<Path>) -> PathBuf {
+        directory.as_ref().join(self.file_name())
+    }
+}
+
+fn file_name(path: &Path) -> Result<String, ModelError> {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| ModelError::MissingFileName(path.display().to_string()))
+}
+
+fn cache_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
 
 /// File-level configuration shared by model implementations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,5 +248,27 @@ mod tests {
             resolve_model(invalid),
             Err(ModelError::InvalidConfig(_))
         ));
+    }
+
+    #[test]
+    fn model_cache_key_uses_component_file_names() {
+        let key = ModelCacheKey::from_paths(
+            ModelType::Anima,
+            r"C:\models\anima.safetensors",
+            r"D:\encoders\qwen.safetensors",
+            r"D:\vae\image_vae.safetensors",
+        )
+        .unwrap();
+        assert_eq!(key.diffusion_model, "anima.safetensors");
+        assert_eq!(
+            key.file_name(),
+            "anima--anima.safetensors--qwen.safetensors--image_vae.safetensors.afbcache"
+        );
+        assert_eq!(
+            key.path_in("target/cache"),
+            PathBuf::from(
+                "target/cache/anima--anima.safetensors--qwen.safetensors--image_vae.safetensors.afbcache"
+            )
+        );
     }
 }

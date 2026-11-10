@@ -10,6 +10,8 @@ afterburner = { path = "../.." }
 burn = "0.19"
 burn-autodiff = "0.19"
 burn-cuda = { version = "0.19", optional = true }
+cubecl-core = { version = "0.8.1", optional = true }
+cubecl-cuda = { version = "0.8.1", optional = true }
 burn-ndarray = "0.19"
 burn-optim = "0.19"
 candle-core = "0.9"
@@ -21,6 +23,7 @@ serde_json = "1"
 [features]
 default = []
 checkpointing = ["afterburner/checkpointing"]
-bf16 = ["cuda", "afterburner/bf16"]
-cuda = ["dep:burn-cuda", "afterburner/cuda"]
+bf16 = ["afterburner/bf16"]
+vulkan = ["afterburner/vulkan"]
+cuda = ["dep:burn-cuda", "dep:cubecl-core", "dep:cubecl-cuda", "afterburner/cuda"]
 

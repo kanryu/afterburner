@@ -50,6 +50,39 @@ BF16 reduces the storage size of model weights and activations, but it can
 change numerical behavior. Validate loss stability and exported LoRA quality
 against the default FP32 path before using it for production runs.
 
+Vulkan training is available through Burn's built-in `vulkan` feature. It uses
+the Burn WGPU backend with the Vulkan/SPIR-V path and does not require a
+direct `burn-wgpu` dependency in Afterburner:
+
+```powershell
+cargo check -p afterburner-cli --features vulkan,checkpointing --offline
+cargo run -p afterburner-cli --features vulkan,checkpointing -- `
+  --device vulkan --train-cache dataset.afbcache `
+  --base-model anima.safetensors --output-lora afterburner-lora.safetensors `
+  --steps 1
+```
+
+When `--device vulkan` is selected, Burn training uses Vulkan while Candle
+preprocessing remains on CPU because Candle's preprocessing path currently
+supports CPU and CUDA devices.
+
+The CLI interprets `--steps` as the number of dataset epochs, matching the
+kohya_ss workflow. One epoch visits every expanded cache sample once, so a
+dataset cache with 270 samples and `--steps 10` performs 2,700 optimizer
+steps. The effective count is printed as `training_steps`.
+
+The default optimizer policy is `warmup_cosine`: the learning rate warms up
+for 10% of the optimization steps, then decays cosinely to 10% of the peak.
+Use `--lr-warmup-steps` and `--lr-min` to override those values. For a
+deliberately fixed rate, use `--lr-schedule constant`.
+
+LoRA SafeTensors storage can be selected independently from the training
+backend with `--lora-dtype f32` or `--lora-dtype bf16`.
+The default follows the compiled training backend: `bf16` builds default to
+BF16 output and other builds default to F32. Pre-quantized base tensors such
+as INT8/INT4 remain in their original representation and are never widened
+or rewritten just to match the LoRA dtype.
+
 For training with long spatial sequences, enable Burn's balanced checkpointing
 strategy in addition to CUDA. Memory-bound operations are then eligible for
 forward recomputation during backward, reducing activation retention at the
@@ -62,11 +95,14 @@ cargo run -p afterburner-cli --features cuda,checkpointing -- `
   --steps 10 --max-resolution 512
 ```
 
-Attention score matrices are computed in 512-query-token chunks. This limits
-each individual score allocation to `512 x context_length` rather than the
+Attention score matrices are computed in 128-query-token chunks by default. This limits
+each individual score allocation to `chunk_size x context_length` rather than the
 full spatial `sequence_length x context_length` matrix. Checkpointing is
 recommended with this mode for training; chunking alone limits allocation
 peaks but does not guarantee that all backward intermediates are discarded.
+For a smaller GPU, override the chunk size with `AFTERBURNER_ATTENTION_CHUNK`,
+for example `AFTERBURNER_ATTENTION_CHUNK=64`. Smaller chunks reduce peak
+temporary memory at the cost of more kernel launches.
 
 ## Training pipeline
 
@@ -118,3 +154,37 @@ Use `--config path/to/training.json` to load it. Explicit command-line values
 take precedence over values from the JSON file. The supported weighting
 schemes are `none`, `sigma_sqrt`, and `cosmap`; `checkpoint_prefix` is used
 with `checkpoint_every` to periodically write LoRA-only SafeTensors files.
+
+When preprocessing without `--output-cache`, Afterburner stores the AFBCACHE
+under `target/afterburner-model-cache` using a key derived from the diffusion
+model, text encoder, and VAE file names. Use `--model-cache-dir` to change the
+directory. The same three file names load the existing cache; changing any one
+of them produces a new cache key and rebuilds the cache.
+
+Dataset roots may contain repeat-count subfolders such as
+`30_Elvira - Atelier Sophie 2` or `5_other-character`. The numeric prefix is
+applied independently to that folder, so multiple folders can use different
+repeat counts. The cache loader also compares the expanded sample layout and
+rebuilds the model-keyed cache when dataset folders or repeat counts change.
+### Memory preflight
+
+Training can be guarded before the base model is initialized:
+
+```text
+afterburner-cli --train-cache ... --base-model ... --output-lora ... \
+  --steps 1 --memory-budget-gb 16
+```
+
+The CLI prints a conservative estimate based on the cache shape, attention
+chunk size, backend dtype, base model file, and current 28-block autograd
+retention. If the estimate exceeds the budget, it exits before allocating
+model tensors. This is a safety gate, not an exact driver-level VRAM report.
+The base model is also held in CubeCL's persistent allocation pool on CUDA;
+transient activations remain dynamic until a backend-level workspace allocator
+is available.
+
+CUDA runs call CubeCL memory cleanup after every optimizer step. Set
+`AFTERBURNER_MEMORY_LOG_EVERY=1` to print `bytes_in_use` and
+`bytes_reserved` for every step; the default is every 10 steps. A rising
+`bytes_reserved` with stable `bytes_in_use` is allocator pooling, while a
+rising `bytes_in_use` indicates live tensors or an unreleased graph.

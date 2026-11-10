@@ -311,7 +311,11 @@ impl InMemoryTrainingCache {
         }
         let count = bounded_count(read_u64(&mut file)?, "sample count")?;
         let mut cache = Self::new();
-        for _ in 0..count {
+        let show_progress = std::env::var_os("AFTERBURNER_CACHE_PROGRESS").is_some();
+        for index in 0..count {
+            if show_progress && (index == 0 || index % 10 == 0) {
+                eprintln!("[cache] loading sample {}/{}", index + 1, count);
+            }
             let sample_id = String::from_utf8(read_bytes(&mut file)?)
                 .map_err(|_| CacheError::InvalidFormat("sample id is not UTF-8".into()))?;
             let repeat_index = read_u64(&mut file)? as usize;
@@ -357,7 +361,13 @@ impl InMemoryTrainingCache {
                 None => sample,
             });
         }
+        if show_progress {
+            eprintln!("[cache] validating {} loaded samples", cache.len());
+        }
         cache.validate()?;
+        if show_progress {
+            eprintln!("[cache] validation complete");
+        }
         Ok(cache)
     }
 }

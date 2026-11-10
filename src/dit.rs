@@ -9,7 +9,7 @@ use burn::{
     module::{Initializer, Module, Param},
     nn::{Embedding, EmbeddingConfig},
     tensor::{
-        Int, Tensor, TensorData, activation::gelu, activation::silu, activation::softmax,
+        DType, Int, Tensor, TensorData, activation::gelu, activation::silu, activation::softmax,
         backend::Backend,
     },
 };
@@ -23,7 +23,15 @@ use crate::{
 ///
 /// With checkpointing enabled, the per-chunk operations can be recomputed
 /// during backward instead of retaining every intermediate activation.
-const ATTENTION_QUERY_CHUNK_SIZE: usize = 512;
+const ATTENTION_QUERY_CHUNK_SIZE: usize = 128;
+
+fn attention_query_chunk_size() -> usize {
+    std::env::var("AFTERBURNER_ATTENTION_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(ATTENTION_QUERY_CHUNK_SIZE)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnimaDiTConfigError {
@@ -411,8 +419,9 @@ impl<B: Backend> AnimaAttention<B> {
         let key = k.swap_dims(2, 3);
         let scale = 1.0 / (self.head_size as f32).sqrt();
         let mut attended_chunks = Vec::new();
-        for query_start in (0..query_length).step_by(ATTENTION_QUERY_CHUNK_SIZE) {
-            let query_end = (query_start + ATTENTION_QUERY_CHUNK_SIZE).min(query_length);
+        let query_chunk_size = attention_query_chunk_size();
+        for query_start in (0..query_length).step_by(query_chunk_size) {
+            let query_end = (query_start + query_chunk_size).min(query_length);
             let query = q.clone().slice([
                 0..batch,
                 0..self.head_count,
@@ -423,7 +432,13 @@ impl<B: Backend> AnimaAttention<B> {
             if let Some(mask) = context_mask.clone() {
                 scores = scores.add(mask);
             }
-            attended_chunks.push(softmax(scores, 3).matmul(v.clone()));
+            // Keep attention tensors in the backend dtype, but evaluate the
+            // numerically sensitive softmax normalization in F32. This is
+            // required by some Vulkan BF16 shader paths.
+            let attended = softmax(scores.clone().cast(DType::F32), 3)
+                .cast(scores.dtype())
+                .matmul(v.clone());
+            attended_chunks.push(attended);
         }
         let attended = Tensor::cat(attended_chunks, 2).swap_dims(1, 2).reshape([
             batch,
@@ -675,13 +690,18 @@ impl<B: Backend> AnimaRmsNorm<B> {
     }
 
     fn forward<const D: usize>(&self, input: Tensor<B, D>) -> Tensor<B, D> {
-        let rms = input
+        let dtype = input.dtype();
+        let input_f32 = input.clone().cast(DType::F32);
+        let rms = input_f32
             .clone()
             .square()
             .mean_dim(D - 1)
             .add_scalar(self.epsilon)
             .sqrt();
-        input.div(rms).mul(self.gamma.val().detach().unsqueeze())
+        input_f32
+            .div(rms)
+            .mul(self.gamma.val().detach().cast(DType::F32).unsqueeze())
+            .cast(dtype)
     }
 }
 
@@ -1038,6 +1058,16 @@ impl<B: Backend> AnimaDiT<B> {
         adapter_input_ids: Option<Tensor<B, 2, Int>>,
         adapter_mask: Option<Tensor<B, 4>>,
     ) -> Tensor<B, 3> {
+        let debug = std::env::var_os("AFTERBURNER_DEBUG_FORWARD").is_some();
+        if debug {
+            eprintln!(
+                "[forward] start latent={:?} text={:?} timestep={:?} conditioned={}",
+                latent_tokens.dims(),
+                text.dims(),
+                timestep_features.dims(),
+                adapter_input_ids.is_some()
+            );
+        }
         let conditioned = adapter_input_ids.is_some();
         let text = match adapter_input_ids {
             Some(input_ids) => self.llm_adapter.forward_with_conditioning(
@@ -1048,10 +1078,23 @@ impl<B: Backend> AnimaDiT<B> {
             ),
             None => self.llm_adapter.forward_with_mask(text, text_mask.clone()),
         };
+        if debug {
+            eprintln!("[forward] text conditioning complete: {:?}", text.dims());
+        }
         let (timestep_embedding, time_condition) =
             self.timestep_embedder.forward(timestep_features);
+        if debug {
+            eprintln!(
+                "[forward] timestep complete: embedding={:?} condition={:?}",
+                timestep_embedding.dims(),
+                time_condition.dims()
+            );
+        }
         let mut hidden = self.input_projection.forward(latent_tokens);
-        for block in &self.blocks {
+        if debug {
+            eprintln!("[forward] input projection complete: {:?}", hidden.dims());
+        }
+        for (index, block) in self.blocks.iter().enumerate() {
             hidden = block.forward_with_text_mask_and_spatial(
                 hidden,
                 text.clone(),
@@ -1060,10 +1103,16 @@ impl<B: Backend> AnimaDiT<B> {
                 if conditioned { None } else { text_mask.clone() },
                 Some(spatial),
             );
+            if debug {
+                eprintln!("[forward] block {} complete: {:?}", index, hidden.dims());
+            }
         }
         let hidden = self
             .final_modulation
             .forward(hidden, time_condition, timestep_embedding);
+        if debug {
+            eprintln!("[forward] final modulation complete: {:?}", hidden.dims());
+        }
         self.output_projection.forward(hidden)
     }
 }

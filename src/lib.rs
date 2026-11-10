@@ -32,7 +32,9 @@ pub use dit::{
 };
 pub use logging::{KohyaLogger, NullLogger, StderrLogger, TrainingLogger, log_preparation};
 pub use lora::{LoraConfig, LoraError, LoraLinear, LoraLinearConfig, LoraTarget, LoraTargetKind};
-pub use model::{ModelConfig, ModelDescriptor, ModelError, ModelType, resolve_model};
+pub use model::{
+    ModelCacheKey, ModelConfig, ModelDescriptor, ModelError, ModelType, resolve_model,
+};
 pub use preprocess::{
     CompositePreprocessor, ImageVae, PreprocessError, TextEncoder, TextEncoding,
     TrainingPreprocessor, preprocess_dataset, preprocess_dataset_with_logger,
@@ -43,11 +45,13 @@ pub use text::{
     T5Tokenizer, TokenizedCaption,
 };
 pub use training::{
-    TrainingError, TrainingReport, optimizer_step, optimizer_step_with_config, train_cached,
-    train_cached_with_options, train_cached_with_options_and_logger,
+    LearningRatePolicy, TrainingError, TrainingReport, optimizer_step, optimizer_step_with_config,
+    train_cached, train_cached_with_options, train_cached_with_options_and_logger,
     train_cached_with_options_and_logger_and_checkpoint,
-    train_cached_with_options_and_logger_and_checkpoint_with_weighting, train_cached_with_target,
-    training_loss, training_loss_with_weighting,
+    train_cached_with_options_and_logger_and_checkpoint_with_weighting,
+    train_cached_with_options_and_logger_and_checkpoint_with_weighting_and_policy,
+    train_cached_with_options_and_logger_and_checkpoint_with_weighting_and_policy_and_step_hook,
+    train_cached_with_target, training_loss, training_loss_with_weighting,
 };
 pub use vae::{
     LatentScaling, QwenImageVaeEncoder, QwenImageVaePreprocessor, VaeConfig, VaeError, VaePipeline,
@@ -55,7 +59,8 @@ pub use vae::{
 };
 pub use weights::{
     AnimaLoadReport, AnimaLoraFactorPlan, AnimaLoraPlan, AnimaWeightCoverage, AnimaWeightSlot,
-    QwenImageVaeCoverage, WeightError, export_anima_lora, export_anima_lora_with_config,
+    LoraOutputDtype, QwenImageVaeCoverage, WeightError, export_anima_lora,
+    export_anima_lora_with_config, export_anima_lora_with_config_and_dtype,
     inspect_anima_lora_factors, inspect_anima_lora_file, inspect_anima_weight_coverage,
     inspect_qwen_image_vae, load_anima_lora_factors, load_anima_lora_linear, load_anima_model,
     load_anima_weights, map_anima_weight_key,

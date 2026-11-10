@@ -270,6 +270,48 @@ pub struct TrainingReport {
     pub last_loss: Option<f32>,
 }
 
+/// Learning-rate policy applied once per optimizer update.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LearningRatePolicy {
+    /// Keep the configured learning rate unchanged.
+    Constant { learning_rate: f64 },
+    /// Linearly warm up, then cosine-decay to the minimum learning rate.
+    WarmupCosine {
+        peak_learning_rate: f64,
+        min_learning_rate: f64,
+        warmup_steps: usize,
+        total_steps: usize,
+    },
+}
+
+impl LearningRatePolicy {
+    pub fn learning_rate(self, step: usize) -> f64 {
+        match self {
+            Self::Constant { learning_rate } => learning_rate,
+            Self::WarmupCosine {
+                peak_learning_rate,
+                min_learning_rate,
+                warmup_steps,
+                total_steps,
+            } => {
+                let total_steps = total_steps.max(1);
+                let warmup_steps = warmup_steps.min(total_steps);
+                if warmup_steps > 0 && step < warmup_steps {
+                    return peak_learning_rate
+                        * (step.saturating_add(1) as f64 / warmup_steps as f64);
+                }
+                let decay_steps = total_steps.saturating_sub(warmup_steps).max(1);
+                let decay_step = step.saturating_sub(warmup_steps).min(decay_steps);
+                let progress = decay_step as f64 / decay_steps as f64;
+                min_learning_rate
+                    + 0.5
+                        * (peak_learning_rate - min_learning_rate)
+                        * (1.0 + (std::f64::consts::PI * progress).cos())
+            }
+        }
+    }
+}
+
 /// Runs a deterministic cache-only LoRA training loop.
 pub fn train_cached<B, O>(
     optimizer: &mut O,
@@ -432,7 +474,7 @@ where
 /// Checkpoint-capable cache training with explicit Anima loss weighting.
 pub fn train_cached_with_options_and_logger_and_checkpoint_with_weighting<B, O, L>(
     optimizer: &mut O,
-    mut model: AnimaDiT<B>,
+    model: AnimaDiT<B>,
     cache: &InMemoryTrainingCache,
     schedule: &DiffusionSchedule,
     steps: usize,
@@ -442,8 +484,90 @@ pub fn train_cached_with_options_and_logger_and_checkpoint_with_weighting<B, O, 
     lora: LoraConfig,
     logger: &mut L,
     checkpoint_every: Option<usize>,
+    checkpoint: Option<&mut dyn FnMut(usize, &AnimaDiT<B>) -> Result<(), TrainingError>>,
+    loss_weighting: LossWeighting,
+) -> Result<(AnimaDiT<B>, TrainingReport), TrainingError>
+where
+    B: AutodiffBackend,
+    O: Optimizer<AnimaDiT<B>, B>,
+    L: TrainingLogger,
+{
+    train_cached_with_options_and_logger_and_checkpoint_with_weighting_and_policy(
+        optimizer,
+        model,
+        cache,
+        schedule,
+        steps,
+        LearningRatePolicy::Constant { learning_rate },
+        seed,
+        target_kind,
+        lora,
+        logger,
+        checkpoint_every,
+        checkpoint,
+        loss_weighting,
+    )
+}
+
+/// Checkpoint-capable cache training with an adaptive learning-rate policy.
+pub fn train_cached_with_options_and_logger_and_checkpoint_with_weighting_and_policy<B, O, L>(
+    optimizer: &mut O,
+    model: AnimaDiT<B>,
+    cache: &InMemoryTrainingCache,
+    schedule: &DiffusionSchedule,
+    steps: usize,
+    learning_rate_policy: LearningRatePolicy,
+    seed: u64,
+    target_kind: TrainingTarget,
+    lora: LoraConfig,
+    logger: &mut L,
+    checkpoint_every: Option<usize>,
+    checkpoint: Option<&mut dyn FnMut(usize, &AnimaDiT<B>) -> Result<(), TrainingError>>,
+    loss_weighting: LossWeighting,
+) -> Result<(AnimaDiT<B>, TrainingReport), TrainingError>
+where
+    B: AutodiffBackend,
+    O: Optimizer<AnimaDiT<B>, B>,
+    L: TrainingLogger,
+{
+    train_cached_with_options_and_logger_and_checkpoint_with_weighting_and_policy_and_step_hook(
+        optimizer,
+        model,
+        cache,
+        schedule,
+        steps,
+        learning_rate_policy,
+        seed,
+        target_kind,
+        lora,
+        logger,
+        checkpoint_every,
+        checkpoint,
+        loss_weighting,
+        None,
+    )
+}
+
+/// Checkpoint-capable cache training with a per-step resource hook.
+pub fn train_cached_with_options_and_logger_and_checkpoint_with_weighting_and_policy_and_step_hook<
+    B,
+    O,
+    L,
+>(
+    optimizer: &mut O,
+    mut model: AnimaDiT<B>,
+    cache: &InMemoryTrainingCache,
+    schedule: &DiffusionSchedule,
+    steps: usize,
+    learning_rate_policy: LearningRatePolicy,
+    seed: u64,
+    target_kind: TrainingTarget,
+    lora: LoraConfig,
+    logger: &mut L,
+    checkpoint_every: Option<usize>,
     mut checkpoint: Option<&mut dyn FnMut(usize, &AnimaDiT<B>) -> Result<(), TrainingError>>,
     loss_weighting: LossWeighting,
+    mut after_step: Option<&mut dyn FnMut(usize)>,
 ) -> Result<(AnimaDiT<B>, TrainingReport), TrainingError>
 where
     B: AutodiffBackend,
@@ -489,24 +613,44 @@ where
             TrainingExample::from_cache_with_target(sample, schedule, timestep, noise, target_kind)
         }
         .map_err(|error| TrainingError::Vae(error.to_string()))?;
+        if std::env::var_os("AFTERBURNER_DEBUG_FORWARD").is_some() {
+            logger.info(&format!(
+                "[debug] sample={} latent={:?} text={:?} timestep={:?} adapter_ids={}",
+                step % cache.len(),
+                example.noisy_latent.shape,
+                example.text_embedding.shape,
+                example.timestep_features.shape,
+                example.adapter_input_ids.is_some()
+            ));
+        }
         let loss = training_loss_with_weighting(&model, &example, loss_weighting)?;
+        if std::env::var_os("AFTERBURNER_DEBUG_FORWARD").is_some() {
+            logger.info("[debug] loss forward complete");
+        }
         let values = loss
             .to_data()
             .to_vec::<<B as burn::tensor::backend::Backend>::FloatElem>()
             .map_err(|error| TrainingError::Metrics(format!("{error:?}")))?;
         last_loss = values.first().map(|value| value.elem::<f32>());
         let loss_value = last_loss.unwrap_or_default();
+        let effective_learning_rate = learning_rate_policy.learning_rate(step);
         logger.info(&format!(
-            "steps: {}/{} ({:.0}%), avr_loss={loss_value:.3}",
+            "steps: {}/{} ({:.0}%), avr_loss={loss_value:.3}, lr={effective_learning_rate:.3e}",
             step + 1,
             steps,
             ((step + 1) as f32 / steps.max(1) as f32) * 100.0
         ));
-        model = optimizer_step_with_config(optimizer, model, loss, learning_rate, &lora);
+        model = optimizer_step_with_config(optimizer, model, loss, effective_learning_rate, &lora);
+        if std::env::var_os("AFTERBURNER_DEBUG_FORWARD").is_some() {
+            logger.info("[debug] optimizer step complete");
+        }
         if let (Some(interval), Some(callback)) = (checkpoint_every, checkpoint.as_mut()) {
             if interval > 0 && (step + 1) % interval == 0 {
                 callback(step + 1, &model)?;
             }
+        }
+        if let Some(hook) = after_step.as_mut() {
+            hook(step + 1);
         }
     }
     logger.info(&format!(

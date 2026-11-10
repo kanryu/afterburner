@@ -101,7 +101,12 @@ pub enum AnimaWeightSlot {
 }
 
 pub fn map_anima_weight_key(key: &str) -> Option<AnimaWeightSlot> {
-    let key = key.strip_prefix("model.diffusion_model.")?;
+    // Kohya/ComfyUI checkpoints use model.diffusion_model.*, while the
+    // native Anima checkpoint used by the current workflow stores the same
+    // module tree below net.*. Normalize both forms before dispatching.
+    let key = key
+        .strip_prefix("model.diffusion_model.")
+        .or_else(|| key.strip_prefix("net."))?;
     if key == "x_embedder.proj.1.weight" {
         return Some(AnimaWeightSlot::InputProjection);
     }
@@ -373,9 +378,22 @@ pub fn load_anima_model<B: Backend>(
     lora: &LoraConfig,
     device: &B::Device,
 ) -> Result<(AnimaDiT<B>, AnimaLoadReport), WeightError> {
+    let started = std::time::Instant::now();
+    eprintln!("[load] AnimaDiT initialization started");
     let mut model = AnimaDiT::init(&AnimaConfig::default(), lora, device)
         .map_err(|error| WeightError::Lora(error.to_string()))?;
+    eprintln!(
+        "[load] AnimaDiT initialization finished in {:.3}s; loading SafeTensors",
+        started.elapsed().as_secs_f64()
+    );
+    let weights_started = std::time::Instant::now();
     let report = load_anima_weights(path, &mut model)?;
+    eprintln!(
+        "[load] SafeTensors loading finished in {:.3}s (loaded={}, skipped={})",
+        weights_started.elapsed().as_secs_f64(),
+        report.loaded_count(),
+        report.skipped_count()
+    );
     Ok((model, report))
 }
 
@@ -391,14 +409,34 @@ pub fn load_anima_lora_factors<B: Backend>(
     let device = model.input_projection.weight.val().device();
     let mut loaded = 0;
     for (key, view) in tensors.iter() {
+        let Some(key) = key
+            .strip_prefix("diffusion_model.")
+            .or_else(|| key.strip_prefix("model.diffusion_model."))
+        else {
+            continue;
+        };
         let Some((target_name, factor)) = key
-            .strip_prefix("model.diffusion_model.")
-            .and_then(|key| key.strip_suffix(".weight"))
+            .strip_suffix(".weight")
             .and_then(|key| key.rsplit_once(".lora_"))
         else {
             continue;
         };
-        let Some(target) = lora_target_mut(model, target_name) else {
+        let target_name = match target_name {
+            name if name.ends_with(".mlp.layer1") => {
+                format!("{}mlp_layer1", &name[..name.len() - ".mlp.layer1".len()])
+            }
+            name if name.ends_with(".mlp.layer2") => {
+                format!("{}mlp_layer2", &name[..name.len() - ".mlp.layer2".len()])
+            }
+            name if name.ends_with(".mlp.0") => {
+                format!("{}mlp_layer1", &name[..name.len() - ".mlp.0".len()])
+            }
+            name if name.ends_with(".mlp.2") => {
+                format!("{}mlp_layer2", &name[..name.len() - ".mlp.2".len()])
+            }
+            name => name.to_owned(),
+        };
+        let Some(target) = lora_target_mut(model, &target_name) else {
             continue;
         };
         if factor != "down" && factor != "up" {
@@ -645,6 +683,13 @@ struct OwnedTensorView {
     data: Vec<u8>,
 }
 
+/// Storage dtype for exported LoRA factor tensors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoraOutputDtype {
+    F32,
+    BF16,
+}
+
 impl safetensors::tensor::View for OwnedTensorView {
     fn dtype(&self) -> Dtype {
         self.dtype
@@ -667,16 +712,20 @@ struct LoraCollector<B: Backend> {
     tensors: Vec<(String, OwnedTensorView)>,
     error: Option<String>,
     target_modules: Vec<String>,
+    alpha: f32,
+    output_dtype: LoraOutputDtype,
     path: Vec<String>,
     marker: std::marker::PhantomData<B>,
 }
 
 impl<B: Backend> LoraCollector<B> {
-    fn new(lora: &LoraConfig) -> Self {
+    fn new(lora: &LoraConfig, output_dtype: LoraOutputDtype) -> Self {
         Self {
             tensors: Vec::new(),
             error: None,
             target_modules: lora.target_modules.clone(),
+            alpha: lora.alpha as f32,
+            output_dtype,
             path: Vec::new(),
             marker: std::marker::PhantomData,
         }
@@ -706,27 +755,46 @@ impl<B: Backend> ModuleVisitor<B> for LoraCollector<B> {
         if path.len() < 3 || path[0] != "blocks" {
             return;
         }
-        let module = match path[2..path.len() - 1].join(".").as_str() {
+        let internal_module = match path[2..path.len() - 1].join(".").as_str() {
             "mlp_layer1" => "mlp.layer1".to_owned(),
             "mlp_layer2" => "mlp.layer2".to_owned(),
             value => value.to_owned(),
         };
-        if !self.target_modules.iter().any(|target| target == &module) {
+        if !self
+            .target_modules
+            .iter()
+            .any(|target| target == &internal_module)
+        {
             return;
         }
-        let key = format!(
-            "model.diffusion_model.{}.weight",
-            path.iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(".")
-        );
+        // ComfyUI's Anima GPT2FeedForward exposes the projections as
+        // mlp.layer1 and mlp.layer2, matching the native checkpoint names.
+        let module = internal_module;
+        // Match kohya_ss/networks.lora_anima, which is the native Anima LoRA
+        // format recognized by ComfyUI. Dots in the target path are flattened
+        // to underscores under the lora_unet_ prefix.
+        let target_key = format!("{}.{}.{}", path[0], path[1], module).replace('.', "_");
+        let key_base = format!("lora_unet_{target_key}");
+        let key = format!("{key_base}.{name}.weight");
+        if name == "lora_down" {
+            self.tensors.push((
+                format!("{key_base}.alpha"),
+                OwnedTensorView {
+                    dtype: Dtype::F32,
+                    shape: Vec::new(),
+                    data: self.alpha.to_le_bytes().to_vec(),
+                },
+            ));
+        }
         let tensor = param.val();
         let data = match tensor.to_data().to_vec::<B::FloatElem>() {
             Ok(values) => values
                 .iter()
                 .map(|value| value.elem::<f32>())
-                .flat_map(|value| value.to_le_bytes())
+                .flat_map(|value| match self.output_dtype {
+                    LoraOutputDtype::F32 => value.to_le_bytes().to_vec(),
+                    LoraOutputDtype::BF16 => bf16::from_f32(value).to_le_bytes().to_vec(),
+                })
                 .collect(),
             Err(error) => {
                 self.error = Some(format!("{error:?}"));
@@ -736,7 +804,10 @@ impl<B: Backend> ModuleVisitor<B> for LoraCollector<B> {
         self.tensors.push((
             key,
             OwnedTensorView {
-                dtype: Dtype::F32,
+                dtype: match self.output_dtype {
+                    LoraOutputDtype::F32 => Dtype::F32,
+                    LoraOutputDtype::BF16 => Dtype::BF16,
+                },
                 shape: tensor.dims().to_vec(),
                 data,
             },
@@ -758,9 +829,20 @@ pub fn export_anima_lora_with_config<B: Backend>(
     model: &AnimaDiT<B>,
     lora: &LoraConfig,
 ) -> Result<usize, WeightError> {
+    export_anima_lora_with_config_and_dtype(path, model, lora, LoraOutputDtype::F32)
+}
+
+/// Exports configured LoRA targets with an explicit SafeTensors storage dtype.
+/// The output dtype is independent of the Burn training backend dtype.
+pub fn export_anima_lora_with_config_and_dtype<B: Backend>(
+    path: impl AsRef<Path>,
+    model: &AnimaDiT<B>,
+    lora: &LoraConfig,
+    output_dtype: LoraOutputDtype,
+) -> Result<usize, WeightError> {
     lora.validate()
         .map_err(|error| WeightError::Export(error.to_string()))?;
-    let mut collector = LoraCollector::<B>::new(lora);
+    let mut collector = LoraCollector::<B>::new(lora, output_dtype);
     model.visit(&mut collector);
     if let Some(error) = collector.error {
         return Err(WeightError::Export(error));
@@ -768,10 +850,21 @@ pub fn export_anima_lora_with_config<B: Backend>(
     if collector.tensors.is_empty() {
         return Err(WeightError::Export("model contains no LoRA factors".into()));
     }
-    let count = collector.tensors.len();
+    let count = collector
+        .tensors
+        .iter()
+        .filter(|(key, _)| key.ends_with(".lora_down.weight") || key.ends_with(".lora_up.weight"))
+        .count();
     let mut metadata = HashMap::new();
     metadata.insert("format".into(), "afterburner-anima-lora-v1".into());
     metadata.insert("base_model".into(), "anima".into());
+    metadata.insert(
+        "dtype".into(),
+        match output_dtype {
+            LoraOutputDtype::F32 => "F32".into(),
+            LoraOutputDtype::BF16 => "BF16".into(),
+        },
+    );
     safetensors::serialize_to_file(collector.tensors, Some(metadata), path.as_ref())
         .map_err(|error| WeightError::Export(error.to_string()))?;
     Ok(count)
@@ -976,13 +1069,14 @@ mod tests {
         }
         .init::<Backend>(&device)
         .unwrap();
-        let mut collector = LoraCollector::<Backend>::new(&LoraConfig::default());
+        let mut collector =
+            LoraCollector::<Backend>::new(&LoraConfig::default(), LoraOutputDtype::F32);
         collector.enter_module("blocks", "AnimaDiT");
         collector.enter_module("0", "Vec");
         collector.enter_module("self_attn", "AnimaAttention");
         collector.enter_module("q_proj", "LoraLinear");
         collector.enter_module("lora_down", "Param");
         collector.visit_float(&layer.lora_down);
-        assert_eq!(collector.tensors.len(), 1);
+        assert_eq!(collector.tensors.len(), 2);
     }
 }

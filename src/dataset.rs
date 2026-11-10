@@ -76,46 +76,45 @@ impl ImageCaptionDataset {
             return Err(DatasetError::InvalidRepeatCount);
         }
 
-        let mut images = fs::read_dir(root.as_ref())?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.is_file() && is_supported_image(path))
-            .collect::<Vec<_>>();
-        images.sort();
+        let mut samples = Vec::new();
+        append_directory_samples(root.as_ref(), repeat_count, &mut samples)?;
+        Ok(Self { samples })
+    }
 
-        let mut samples = Vec::with_capacity(images.len() * repeat_count);
-        for image_path in images {
-            let caption_path = image_path.with_extension("txt");
-            if !caption_path.is_file() {
-                return Err(DatasetError::MissingCaption {
-                    image: image_path,
-                    caption: caption_path,
-                });
-            }
-
-            let bytes = fs::read(&caption_path)?;
-            let caption =
-                String::from_utf8(bytes).map_err(|source| DatasetError::InvalidCaption {
-                    caption: caption_path.clone(),
-                    source,
-                })?;
-            let caption = caption.trim().to_owned();
-            if caption.is_empty() {
-                return Err(DatasetError::EmptyCaption {
-                    caption: caption_path,
-                });
-            }
-
-            for repeat_index in 0..repeat_count {
-                samples.push(TrainingSample {
-                    image_path: image_path.clone(),
-                    caption_path: caption_path.clone(),
-                    caption: caption.clone(),
-                    repeat_index,
-                });
-            }
+    /// Scans a dataset root and derives repeat counts from immediate folders.
+    ///
+    /// A folder named `30_character` contributes each image-caption pair 30
+    /// times. When no numbered child folders exist, the root folder itself is
+    /// checked for the same prefix before falling back to `default_repeat`.
+    pub fn from_dir_with_folder_repeats(
+        root: impl AsRef<Path>,
+        default_repeat: usize,
+    ) -> Result<Self, DatasetError> {
+        if default_repeat == 0 {
+            return Err(DatasetError::InvalidRepeatCount);
         }
 
+        let root = root.as_ref();
+        let mut directories = fs::read_dir(root)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        directories.sort();
+        let numbered = directories
+            .iter()
+            .filter_map(|path| parse_repeat_folder_name(path).map(|repeat| (path, repeat)))
+            .collect::<Vec<_>>();
+
+        let mut samples = Vec::new();
+        if numbered.is_empty() {
+            let repeat = parse_repeat_folder_name(root).unwrap_or(default_repeat);
+            append_directory_samples(root, repeat, &mut samples)?;
+        } else {
+            for (directory, repeat) in numbered {
+                append_directory_samples(directory, repeat, &mut samples)?;
+            }
+        }
         Ok(Self { samples })
     }
 
@@ -129,6 +128,58 @@ impl ImageCaptionDataset {
     pub fn load_rgb(sample: &TrainingSample) -> Result<image::RgbImage, image::ImageError> {
         image::open(&sample.image_path).map(|image| image.to_rgb8())
     }
+}
+
+fn append_directory_samples(
+    root: &Path,
+    repeat_count: usize,
+    samples: &mut Vec<TrainingSample>,
+) -> Result<(), DatasetError> {
+    let mut images = fs::read_dir(root)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && is_supported_image(path))
+        .collect::<Vec<_>>();
+    images.sort();
+
+    for image_path in images {
+        let caption_path = image_path.with_extension("txt");
+        if !caption_path.is_file() {
+            return Err(DatasetError::MissingCaption {
+                image: image_path,
+                caption: caption_path,
+            });
+        }
+
+        let bytes = fs::read(&caption_path)?;
+        let caption = String::from_utf8(bytes).map_err(|source| DatasetError::InvalidCaption {
+            caption: caption_path.clone(),
+            source,
+        })?;
+        let caption = caption.trim().to_owned();
+        if caption.is_empty() {
+            return Err(DatasetError::EmptyCaption {
+                caption: caption_path,
+            });
+        }
+
+        for repeat_index in 0..repeat_count {
+            samples.push(TrainingSample {
+                image_path: image_path.clone(),
+                caption_path: caption_path.clone(),
+                caption: caption.clone(),
+                repeat_index,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn parse_repeat_folder_name(path: &Path) -> Option<usize> {
+    let name = path.file_name()?.to_str()?;
+    let (prefix, _) = name.split_once('_')?;
+    let repeat = prefix.parse::<usize>().ok()?;
+    (repeat > 0).then_some(repeat)
 }
 
 impl Dataset<TrainingSample> for ImageCaptionDataset {
@@ -191,6 +242,40 @@ mod tests {
             ImageCaptionDataset::from_dir(&root, 1),
             Err(DatasetError::MissingCaption { .. })
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn expands_repeats_per_numbered_subfolder() {
+        let root =
+            std::env::temp_dir().join(format!("afterburner-folder-repeats-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("30_Elvira")).unwrap();
+        fs::create_dir_all(root.join("2_other")).unwrap();
+        for (directory, name) in [("30_Elvira", "elvira"), ("2_other", "other")] {
+            let image = root.join(directory).join(format!("{name}.png"));
+            fs::write(&image, []).unwrap();
+            fs::write(image.with_extension("txt"), name).unwrap();
+        }
+
+        let dataset = ImageCaptionDataset::from_dir_with_folder_repeats(&root, 1).unwrap();
+        assert_eq!(dataset.len(), 32);
+        assert_eq!(
+            dataset
+                .samples()
+                .iter()
+                .filter(|sample| sample.caption == "elvira")
+                .count(),
+            30
+        );
+        assert_eq!(
+            dataset
+                .samples()
+                .iter()
+                .filter(|sample| sample.caption == "other")
+                .count(),
+            2
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }
