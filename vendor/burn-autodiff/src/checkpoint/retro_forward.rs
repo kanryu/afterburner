@@ -21,6 +21,10 @@ pub(crate) struct RetroForwards {
 }
 
 impl RetroForwards {
+    pub(crate) fn clear(&mut self) {
+        self.map.clear();
+    }
+
     /// Executes the [RetroForward] for a given [NodeId] if the node's
     /// [State] is [State::Recompute], otherwise does nothing.
     pub(crate) fn execute_retro_forward(

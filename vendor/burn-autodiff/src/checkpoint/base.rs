@@ -29,6 +29,11 @@ pub struct Checkpointer {
 }
 
 impl Checkpointer {
+    pub(crate) fn clear(&mut self) {
+        self.backward_states.clear();
+        self.retro_forwards.clear();
+    }
+
     /// Gives the output of the given node, by recursively asking parents to compute themselves
     /// or give their pre-computed tensors.
     pub fn retrieve_node_output<T>(&mut self, node_id: NodeId) -> T

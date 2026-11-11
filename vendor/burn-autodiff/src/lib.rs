@@ -33,6 +33,14 @@ pub(crate) mod runtime;
 
 pub use backend::*;
 
+/// Reclaim autodiff graph nodes whose tensor handles are no longer alive.
+///
+/// This is intended for optimizer step boundaries, after the previous model
+/// has been consumed and replaced by the updated model.
+pub fn cleanup_dead_nodes() {
+    runtime::graph::cleanup_dead_nodes();
+}
+
 #[cfg(feature = "export_tests")]
 mod tests;
 

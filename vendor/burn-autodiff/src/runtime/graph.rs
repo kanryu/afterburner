@@ -67,6 +67,21 @@ impl core::fmt::Debug for Graph {
 
 static STATE: spin::Mutex<Option<GraphLocator>> = spin::Mutex::new(None);
 
+pub(crate) fn cleanup_dead_nodes() {
+    let mut state = STATE.lock();
+    let Some(locator) = state.as_mut() else {
+        return;
+    };
+
+    let graphs: Vec<Arc<Graph>> = locator.graphs.values().cloned().collect();
+    for graph in graphs {
+        let mut graph_state = graph.state.lock().unwrap();
+        graph_state.server.sweep_dead_nodes();
+    }
+
+    locator.prune_empty_graphs();
+}
+
 impl GraphMutexClient {
     /// Retrieves or creates a graph for the given [NodeId] and parent dependencies.
     ///
@@ -127,8 +142,15 @@ impl AutodiffClient for GraphMutexClient {
 
         let grads = state.server.backward::<GraphCleaner>(grads, node_id);
 
+        // The backward server owns the temporary Steps and checkpoint builders
+        // for this graph. Release the mutex before compacting the global
+        // locator; pruning only graphs whose server and memory-management
+        // state are both empty is safe for the next forward pass.
+        core::mem::drop(state);
+
         let mut cleaner = GraphCleaner::init();
         cleaner.cleanup_orphaned_entries();
+        cleaner.prune_empty_graphs();
 
         grads
     }
@@ -142,6 +164,12 @@ impl<'a> GraphCleaner<'a> {
     fn cleanup_orphaned_entries(&mut self) {
         if let Some(state) = self.guard.as_mut() {
             state.cleanup_untracked();
+        }
+    }
+
+    fn prune_empty_graphs(&mut self) {
+        if let Some(state) = self.guard.as_mut() {
+            state.prune_empty_graphs();
         }
     }
 }
@@ -160,6 +188,31 @@ impl<'a> NodeCleaner for GraphCleaner<'a> {
 }
 
 impl GraphLocator {
+    fn prune_empty_graphs(&mut self) {
+        let mut empty_origins = HashSet::new();
+        for graph in self.graphs.values() {
+            let origin = graph.origin;
+            if empty_origins.contains(&origin) {
+                continue;
+            }
+            let state = graph.state.lock().unwrap();
+            if state.server.is_empty() {
+                empty_origins.insert(origin);
+            }
+        }
+
+        if empty_origins.is_empty() {
+            return;
+        }
+
+        self.graphs
+            .retain(|_, graph| !empty_origins.contains(&graph.origin));
+        self.keys
+            .retain(|origin, _| !empty_origins.contains(origin));
+        self.untracked_nodes
+            .retain(|node| !empty_origins.contains(node));
+    }
+
     /// Selects a single graph for the given [NodeId], considering parent dependencies.
     ///
     /// If multiple graphs are found, they are merged into a single one.

@@ -758,8 +758,6 @@ dependencies = [
 [[package]]
 name = "burn-optim"
 version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31758c02e50247f12457fca1905ed8684ac1b1c5292e10cbbfffb9fa0048d4bd"
 dependencies = [
  "burn-core",
  "derive-new",
@@ -1846,8 +1844,6 @@ dependencies = [
 [[package]]
 name = "cubecl-runtime"
 version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91b823bb5899a6fa8809bf7aa36f93f72ced6de58ab9d6edea2c730b235eeda3"
 dependencies = [
  "async-channel",
  "bytemuck",

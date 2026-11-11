@@ -189,8 +189,16 @@ where
     let gradients = {
         let mut all_gradients = loss.backward();
         let ids = trainable_lora_ids(&model, lora);
-        GradientsParams::from_params(&mut all_gradients, &model, &ids)
+        let gradients = GradientsParams::from_params(&mut all_gradients, &model, &ids);
+        // `backward` consumes the graph's server-side steps, but the loss
+        // tensor itself still owns the root primitive and node until it is
+        // dropped.  Keep it alive through gradient extraction only; retaining
+        // it while Adam builds the next parameter/state tensors makes the old
+        // graph overlap the new optimizer allocation peak.
+        drop(all_gradients);
+        gradients
     };
+    drop(loss);
     optimizer.step(learning_rate, model, gradients)
 }
 
@@ -693,6 +701,10 @@ where
         // the allocator can report one step's activation workspace as still
         // live and appear to grow monotonically.
         B::sync(&device);
+        // The old model and its backward graph are now both past the GPU
+        // synchronization boundary. Only sweep dead autodiff roots here;
+        // doing it before sync leaves CubeCL command bindings alive.
+        burn_autodiff::cleanup_dead_nodes();
         if std::env::var_os("AFTERBURNER_DISABLE_MEMORY_CLEANUP").is_none() {
             B::memory_cleanup(&device);
         }

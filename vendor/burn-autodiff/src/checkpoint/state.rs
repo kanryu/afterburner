@@ -72,6 +72,10 @@ pub struct BackwardStates {
 }
 
 impl BackwardStates {
+    pub(crate) fn clear(&mut self) {
+        self.map.clear();
+    }
+
     /// Returns the output in the state of the given [NodeId],
     /// and decrements the number of times this state is required.
     /// This function always gives ownership of the output, but will clone it if needed for further uses.

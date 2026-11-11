@@ -14,6 +14,9 @@ resolver = "2"
 # Burn 0.19 does not expose this hook from the published crate, so the
 # narrowly-scoped local fork is used by both the library and CLI.
 burn-autodiff = { path = "vendor/burn-autodiff" }
+# Keep transient CUDA workspaces out of CubeCL's persistent model-weight pool.
+cubecl-runtime = { path = "vendor/cubecl-runtime" }
+burn-optim = { path = "vendor/burn-optim" }
 
 [lib]
 name = "afterburner"

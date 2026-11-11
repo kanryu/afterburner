@@ -22,6 +22,10 @@ enum NodeMemoryStatus {
 }
 
 impl GraphMemoryManagement {
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty() && self.leaves.is_empty() && self.statuses.is_empty()
+    }
+
     pub fn extend(&mut self, other: Self) {
         self.nodes.extend(other.nodes);
         self.leaves.extend(other.leaves);
@@ -47,6 +51,41 @@ impl GraphMemoryManagement {
             self.leaves.remove(&node_id);
             self.nodes.remove(&node_id);
         }
+    }
+
+    /// Remove graph nodes that no longer have a tensor owner.
+    ///
+    /// Backward can run while the caller still owns the old model. In that
+    /// case the reference-count test in `free_unavailable_nodes` correctly
+    /// preserves the roots, but there is no later backward pass that would
+    /// revisit them after the model is consumed by the optimizer.
+    pub(crate) fn sweep_dead_nodes(&mut self) -> Vec<NodeId> {
+        let mut removed = Vec::new();
+
+        loop {
+            let dead: Vec<NodeId> = self
+                .nodes
+                .iter()
+                .filter(|(id, parents)| {
+                    Arc::strong_count(id) == 1
+                        && parents.iter().all(|parent| !self.nodes.contains_key(parent))
+                })
+                .map(|(id, _)| *id.as_ref())
+                .collect();
+
+            if dead.is_empty() {
+                break;
+            }
+
+            self.nodes.retain(|id, _| !dead.contains(id.as_ref()));
+            for node in &dead {
+                self.leaves.remove(node);
+                self.statuses.remove(node);
+            }
+            removed.extend(dead);
+        }
+
+        removed
     }
 
     /// Free all nodes whose backward call has become impossible

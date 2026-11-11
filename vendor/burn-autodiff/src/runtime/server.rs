@@ -28,6 +28,19 @@ pub trait NodeCleaner {
 }
 
 impl AutodiffServer {
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+            && self.actions_builder.is_empty()
+            && self.memory_management.is_empty()
+    }
+
+    pub(crate) fn sweep_dead_nodes(&mut self) {
+        for node in self.memory_management.sweep_dead_nodes() {
+            self.steps.remove(&node);
+            self.actions_builder.remove(&node);
+        }
+    }
+
     pub fn extend(&mut self, other: AutodiffServer) {
         self.steps.extend(other.steps);
         self.actions_builder.extend(other.actions_builder);
@@ -117,6 +130,12 @@ impl AutodiffServer {
                 .into_iter()
                 .for_each(|step| step.step(&mut grads, &mut checkpointer))
         });
+
+        // All backward steps have completed. Drop any checkpoint that was
+        // conservatively retained by the n_required accounting before the
+        // gradients are handed back to the caller. This shortens the overlap
+        // between backward workspaces and optimizer allocations.
+        checkpointer.clear();
 
         #[cfg(feature = "export_tests")]
         // For checkpointing tests
