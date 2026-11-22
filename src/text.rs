@@ -9,7 +9,18 @@ use std::path::Path;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::qwen3;
-use tokenizers::Tokenizer;
+use tokenizers::{
+    SplitDelimiterBehavior, Tokenizer,
+    decoders::byte_level::ByteLevel as ByteLevelDecoder,
+    models::bpe::BPE,
+    normalizers::unicode::NFC,
+    pre_tokenizers::{
+        PreTokenizerWrapper,
+        byte_level::ByteLevel,
+        sequence::Sequence,
+        split::{Split, SplitPattern},
+    },
+};
 
 use crate::{
     cache::AdapterConditioning,
@@ -85,11 +96,15 @@ impl T5Tokenizer {
             .encode(caption, true)
             .map_err(|error| format!("T5 tokenization failed: {error}"))?;
         let mut ids = encoding.get_ids().to_vec();
+        let mut attention_mask = encoding
+            .get_attention_mask()
+            .iter()
+            .map(|value| *value as f32)
+            .collect::<Vec<_>>();
         ids.truncate(self.max_length);
-        let token_count = ids.len();
+        attention_mask.truncate(self.max_length);
         ids.resize(self.max_length, self.pad_token_id);
-        let mut attention_mask = vec![0.0; self.max_length];
-        attention_mask[..token_count].fill(1.0);
+        attention_mask.resize(self.max_length, 0.0);
         Ok(TokenizedCaption {
             token_ids: ids,
             attention_mask: Some(attention_mask),
@@ -113,8 +128,56 @@ impl QwenTokenizer {
             return Err("tokenizer max_length must be greater than zero".into());
         }
         let path = path.as_ref();
-        let tokenizer = Tokenizer::from_file(path)
-            .map_err(|error| format!("failed to load tokenizer {}: {error}", path.display()))?;
+        // Qwen3's Transformers tokenizer is the Qwen2 slow tokenizer.  When
+        // its directory contains vocab.json and merges.txt, loading the
+        // tokenizer.json directly can produce a different tokenization (in
+        // particular, it may add a BOS token and expand a short caption to
+        // hundreds of byte-level tokens).  Reconstruct the BPE exactly from
+        // the files used by Transformers.
+        let tokenizer = match path.parent() {
+            Some(directory) => {
+                let vocab = directory.join("vocab.json");
+                let merges = directory.join("merges.txt");
+                if vocab.is_file() && merges.is_file() {
+                    let vocab_string = vocab.to_string_lossy();
+                    let merges_string = merges.to_string_lossy();
+                    let bpe = BPE::from_file(&vocab_string, &merges_string)
+                        .byte_fallback(false)
+                        .build()
+                        .map_err(|error| {
+                            format!(
+                                "failed to build Qwen BPE from {} and {}: {error}",
+                                vocab.display(),
+                                merges.display()
+                            )
+                        })?;
+                    let qwen_pretokenize_regex = r#"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"#;
+                    let split = Split::new(
+                        SplitPattern::Regex(qwen_pretokenize_regex.to_owned()),
+                        SplitDelimiterBehavior::Isolated,
+                        false,
+                    )
+                    .map_err(|error| format!("failed to build Qwen pre-tokenizer: {error}"))?;
+                    let byte_level = ByteLevel::default()
+                        .add_prefix_space(false)
+                        .use_regex(false);
+                    let mut tokenizer = Tokenizer::new(bpe);
+                    tokenizer.with_normalizer(Some(NFC));
+                    tokenizer.with_pre_tokenizer(Some(Sequence::new(vec![
+                        PreTokenizerWrapper::Split(split),
+                        PreTokenizerWrapper::ByteLevel(byte_level),
+                    ])));
+                    tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+                    tokenizer
+                } else {
+                    Tokenizer::from_file(path).map_err(|error| {
+                        format!("failed to load tokenizer {}: {error}", path.display())
+                    })?
+                }
+            }
+            None => Tokenizer::from_file(path)
+                .map_err(|error| format!("failed to load tokenizer {}: {error}", path.display()))?,
+        };
         Ok(Self {
             tokenizer,
             max_length,
@@ -128,11 +191,15 @@ impl QwenTokenizer {
             .encode(caption, true)
             .map_err(|error| format!("tokenization failed: {error}"))?;
         let mut ids = encoding.get_ids().to_vec();
+        let mut attention_mask = encoding
+            .get_attention_mask()
+            .iter()
+            .map(|value| *value as f32)
+            .collect::<Vec<_>>();
         ids.truncate(self.max_length);
-        let token_count = ids.len();
+        attention_mask.truncate(self.max_length);
         ids.resize(self.max_length, self.pad_token_id);
-        let mut attention_mask = vec![0.0; self.max_length];
-        attention_mask[..token_count].fill(1.0);
+        attention_mask.resize(self.max_length, 0.0);
         Ok(TokenizedCaption {
             token_ids: ids,
             attention_mask: Some(attention_mask),
@@ -297,7 +364,28 @@ impl<T: CaptionTokenizer> CandleQwen3TextEncoder<T> {
         &mut self,
         caption: TokenizedCaption,
     ) -> Result<(VaeTensor, Option<VaeTensor>), PreprocessError> {
-        let embedding = self.encode_token_ids(&caption.token_ids)?;
+        let mut embedding = self.encode_token_ids(&caption.token_ids)?;
+        // kohya_ss masks padded Qwen positions after the transformer forward:
+        // ``prompt_embeds[~qwen3_attn_mask.bool()] = 0``.  Returning the mask
+        // without applying it leaves pad-token activations in the cache and
+        // changes both the adapter input and its statistics.
+        if let Some(mask) = &caption.attention_mask {
+            if mask.len() != embedding.shape[1] {
+                return Err(PreprocessError::Encoder(format!(
+                    "Qwen attention mask length {} does not match embedding sequence length {}",
+                    mask.len(),
+                    embedding.shape[1]
+                )));
+            }
+            let hidden = embedding.shape[2];
+            for (token, &value) in mask.iter().enumerate() {
+                if value == 0.0 {
+                    let start = token * hidden;
+                    let end = start + hidden;
+                    embedding.data[start..end].fill(0.0);
+                }
+            }
+        }
         let mask = caption.attention_mask.map(|values| VaeTensor {
             shape: vec![1, 1, 1, values.len()],
             data: values,
@@ -382,6 +470,10 @@ impl<Q: CaptionTokenizer, T: CaptionTokenizer> TextEncoder for AnimaTextEncoder<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preprocess::TextEncoder;
+    use tokenizers::{
+        Tokenizer, models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace,
+    };
 
     #[test]
     fn default_qwen3_config_matches_anima_encoder_shape() {
@@ -397,5 +489,80 @@ mod tests {
         let mut config = Qwen3TextConfig::default();
         config.num_key_value_heads = 3;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn tokenizer_contract_pads_and_masks_deterministically() {
+        let vocab = [
+            ("[UNK]".to_owned(), 0_u32),
+            ("Elvira".to_owned(), 1),
+            ("Atelier".to_owned(), 2),
+            ("Sophie".to_owned(), 3),
+        ]
+        .into_iter()
+        .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".to_owned())
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        let path =
+            std::env::temp_dir().join(format!("afterburner-tokenizer-{}.json", std::process::id()));
+        tokenizer.save(&path, false).unwrap();
+
+        let qwen = QwenTokenizer::from_file(&path, 5, 99).unwrap();
+        let qwen_encoded = qwen.encode_caption("Elvira Atelier Sophie").unwrap();
+        assert_eq!(qwen_encoded.token_ids.len(), 5);
+        assert_eq!(
+            qwen_encoded.attention_mask,
+            Some(vec![1.0, 1.0, 1.0, 0.0, 0.0])
+        );
+        assert_eq!(&qwen_encoded.token_ids[3..], &[99, 99]);
+
+        let t5 = T5Tokenizer::from_file(&path, 2, 0).unwrap();
+        let t5_encoded = t5.encode_caption("Elvira Atelier Sophie").unwrap();
+        assert_eq!(t5_encoded.token_ids.len(), 2);
+        assert_eq!(t5_encoded.attention_mask, Some(vec![1.0, 1.0]));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "loads the full Qwen3 model; set model/tokenizer paths in the test before running"]
+    fn qwen3_and_t5_conditioning_matches_anima_cache_contract() {
+        let qwen_model = std::env::var_os("AFTERBURNER_QWEN3_PATH")
+            .expect("AFTERBURNER_QWEN3_PATH must point to qwen_3_06b_base.safetensors");
+        let qwen_tokenizer = std::env::var_os("AFTERBURNER_QWEN_TOKENIZER_PATH")
+            .expect("AFTERBURNER_QWEN_TOKENIZER_PATH must point to tokenizer.json");
+        let t5_tokenizer = std::env::var_os("AFTERBURNER_T5_TOKENIZER_PATH")
+            .expect("AFTERBURNER_T5_TOKENIZER_PATH must point to tokenizer.json");
+        let qwen = QwenTokenizer::from_file(qwen_tokenizer, 512, 151_643).unwrap();
+        let t5 = T5Tokenizer::from_file(t5_tokenizer, 512, 0).unwrap();
+        let device = Device::Cpu;
+        let qwen = CandleQwen3TextEncoder::from_safetensors(
+            qwen_model,
+            Qwen3TextConfig::default(),
+            DType::F32,
+            &device,
+            qwen,
+        )
+        .unwrap();
+        let mut encoder = AnimaTextEncoder::new(qwen, t5);
+        let encoding = encoder
+            .encode_text_with_conditioning("Elvira, Atelier Sophie 2")
+            .unwrap();
+        assert_eq!(encoding.embedding.shape, vec![1, 512, 1024]);
+        assert_eq!(encoding.attention_mask.unwrap().shape, vec![1, 1, 1, 512]);
+        let adapter = encoding.adapter_conditioning.unwrap();
+        assert_eq!(adapter.input_ids.len(), 512);
+        assert_eq!(adapter.attention_mask.shape, vec![1, 1, 1, 512]);
+        assert!(
+            adapter
+                .attention_mask
+                .data
+                .iter()
+                .any(|value| *value == 1.0)
+        );
     }
 }

@@ -156,7 +156,17 @@ fn append_directory_samples(
             caption: caption_path.clone(),
             source,
         })?;
-        let caption = caption.trim().to_owned();
+        // Kohya's default caption processing uses only the first line when
+        // wildcard processing is disabled (the normal training path). Keep
+        // the same semantics so multi-line caption files do not change the
+        // text encoder input in Afterburner.
+        let caption = caption
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
         if caption.is_empty() {
             return Err(DatasetError::EmptyCaption {
                 caption: caption_path,
@@ -242,6 +252,22 @@ mod tests {
             ImageCaptionDataset::from_dir(&root, 1),
             Err(DatasetError::MissingCaption { .. })
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uses_first_caption_line_like_kohya_default_processing() {
+        let root = std::env::temp_dir().join(format!(
+            "afterburner-dataset-first-line-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("sample.png"), b"not an image").unwrap();
+        fs::write(root.join("sample.txt"), "first line\nsecond line\n").unwrap();
+
+        let dataset = ImageCaptionDataset::from_dir(&root, 1).unwrap();
+        assert_eq!(dataset.get(0).unwrap().caption, "first line");
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -16,15 +16,20 @@ extern crate alloc;
 
 /// Checkpoint module.
 pub mod checkpoint;
+/// Block-scoped activation checkpointing.
+pub mod checkpoint_block;
 /// Gradients module.
 pub mod grads;
 /// Operation module.
 pub mod ops;
 
 pub(crate) mod graph;
+pub use graph::{NodeRef, Requirement};
 // Exported for backend extension
 pub use graph::NodeId;
 pub(crate) mod tensor;
+/// Public primitive handle used by custom backend operations.
+pub use tensor::AutodiffTensor;
 pub(crate) mod utils;
 
 mod backend;

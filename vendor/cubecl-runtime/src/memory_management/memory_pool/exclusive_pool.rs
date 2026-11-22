@@ -58,7 +58,9 @@ struct MemoryPage {
 impl ExclusiveMemoryPool {
     pub(crate) fn new(max_alloc_size: u64, alignment: u64, dealloc_period: u64) -> Self {
         // Pages should be allocated to be aligned.
-        assert_eq!(max_alloc_size % alignment, 0);
+        if max_alloc_size != u64::MAX {
+            assert_eq!(max_alloc_size % alignment, 0);
+        }
 
         Self {
             pages: Vec::new(),
@@ -66,7 +68,14 @@ impl ExclusiveMemoryPool {
             dealloc_period,
             last_dealloc_check: 0,
             max_alloc_size,
-            cur_avg_size: max_alloc_size as f64 / 2.0,
+            // u64::MAX is the direct-allocation fallback pool.  Do not seed
+            // its moving average with half of u64::MAX: that would turn the
+            // first real transient allocation into an impossibly large page.
+            cur_avg_size: if max_alloc_size == u64::MAX {
+                0.0
+            } else {
+                max_alloc_size as f64 / 2.0
+            },
         }
     }
 

@@ -34,6 +34,7 @@ burn-train = "0.19"
 burn-dataset = "0.19"
 burn-store = "0.19"
 burn-cuda = { version = "0.19", optional = true }
+burn-ndarray = "0.19"
 cubecl-core = { version = "0.8.1", optional = true }
 cubecl-cuda = { version = "0.8.1", optional = true }
 cubecl-runtime = { version = "0.8.1", optional = true }
@@ -53,6 +54,7 @@ tokenizers = "0.21"
 default = []
 checkpointing = []
 bf16 = []
+f16 = []
 vulkan = ["burn/vulkan"]
 cuda = [
     "dep:burn-cuda",
@@ -72,7 +74,4 @@ fixed-memory = [
     "dep:cubecl-runtime",
     "cubecl-runtime/exclusive-memory-only",
 ]
-
-[dev-dependencies]
-burn-ndarray = "0.19"
 

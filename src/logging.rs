@@ -1,5 +1,6 @@
 //! kohya_ss-inspired training log formatting.
 
+use std::fs::File;
 use std::io::{self, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -90,6 +91,47 @@ pub type StderrLogger = KohyaLogger<io::Stderr>;
 impl StderrLogger {
     pub fn stderr() -> Self {
         KohyaLogger::new(io::stderr())
+    }
+}
+
+/// Writes a log line to two sinks, preserving the console output while also
+/// keeping a complete session log on disk.
+pub struct TeeWriter<W1: Write, W2: Write> {
+    first: W1,
+    second: W2,
+}
+
+impl<W1: Write, W2: Write> TeeWriter<W1, W2> {
+    pub fn new(first: W1, second: W2) -> Self {
+        Self { first, second }
+    }
+}
+
+impl<W1: Write, W2: Write> Write for TeeWriter<W1, W2> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.first.write_all(bytes)?;
+        self.second.write_all(bytes)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.first.flush()?;
+        self.second.flush()
+    }
+}
+
+pub type StderrFileLogger = KohyaLogger<TeeWriter<io::Stderr, File>>;
+
+impl StderrFileLogger {
+    pub fn open(path: impl AsRef<std::path::Path>) -> io::Result<Self> {
+        // The CLI initializes the session log before creating the structured
+        // training logger. Open in append mode so startup/preflight output is
+        // not truncated when the training phase begins.
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        Ok(KohyaLogger::new(TeeWriter::new(io::stderr(), file)))
     }
 }
 

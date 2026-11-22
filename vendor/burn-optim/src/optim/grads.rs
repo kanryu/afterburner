@@ -8,6 +8,7 @@ use burn::{
     tensor::{
         backend::{AutodiffBackend, Backend},
         container::TensorContainer,
+        ElementConversion, FloatDType, TensorPrimitive,
     },
 };
 
@@ -104,6 +105,63 @@ impl GradientsParams {
     /// If any tensor is contained.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Clips all registered gradients using one global L2 norm.
+    ///
+    /// PyTorch/Accelerate applies `max_grad_norm` to the complete parameter
+    /// set. Applying the same operation independently to every tensor changes
+    /// the optimizer trajectory substantially for LoRA models, which contain
+    /// hundreds of factor tensors.
+    pub fn clip_by_global_norm<B: Backend>(mut self, max_norm: f32) -> Self {
+        if max_norm <= 0.0 || self.container.is_empty() {
+            return self;
+        }
+
+        let ids = self.container.ids().into_iter().copied().collect::<Vec<_>>();
+        let mut values = Vec::with_capacity(ids.len());
+        let mut sum_squares = None;
+
+        for id in ids {
+            let Some(primitive) = self.container.remove::<B>(&id) else {
+                continue;
+            };
+            let value = match &primitive {
+                TensorPrimitive::Float(value) => value.clone(),
+                TensorPrimitive::QFloat(value) => B::dequantize(value.clone()),
+            };
+            let value = B::float_cast(value, FloatDType::F32);
+            let local_sum = B::float_sum(B::float_mul(value.clone(), value));
+            sum_squares = Some(match sum_squares {
+                Some(total) => B::float_add(total, local_sum),
+                None => local_sum,
+            });
+            values.push((id, primitive));
+        }
+
+        let Some(sum_squares) = sum_squares else {
+            return self;
+        };
+        let norm = Tensor::<B, 1>::from_primitive(TensorPrimitive::Float(sum_squares))
+            .sqrt()
+            .into_data()
+            .to_vec::<f32>()
+            .ok()
+            .and_then(|values| values.first().copied())
+            .unwrap_or(0.0);
+        let scale = (max_norm / (norm + 1.0e-6)).min(1.0);
+
+        for (id, primitive) in values {
+            let value = match primitive {
+                TensorPrimitive::Float(value) => value,
+                TensorPrimitive::QFloat(value) => B::dequantize(value),
+            };
+            self.container.register::<B>(
+                id,
+                TensorPrimitive::Float(B::float_mul_scalar(value, scale.elem())),
+            );
+        }
+        self
     }
 
     /// Change the device of each tensor gradients registered for the given [module](AutodiffModule).

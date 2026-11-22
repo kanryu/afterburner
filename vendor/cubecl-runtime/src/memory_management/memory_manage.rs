@@ -40,12 +40,23 @@ fn trace_memory_event(
     }
 
     let sequence = TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    eprintln!(
+    let line = format!(
         "[cubecl-memory] seq={sequence} name={name:?} event={event} pool={pool} requested={requested} in_use={} reserved={} allocations={} released_in_use={released_in_use} released_reserved={released_reserved}",
         usage.bytes_in_use,
         usage.bytes_reserved,
         usage.number_allocs,
     );
+    eprintln!("{line}");
+    let path = std::env::var_os("AFTERBURNER_CUBECL_ALLOC_TRACE_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("logs/cubecl-memory-trace.log"));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 #[cfg(not(feature = "std"))]
@@ -304,6 +315,17 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
                             dealloc_period: Some(dealloc_period),
                         }
                     })
+                    .chain(core::iter::once(MemoryPoolOptions {
+                        // Fallback for a transient allocation larger than
+                        // the device-reported page buckets.  Without this,
+                        // a single 55 MiB attention/MLP workspace panics
+                        // with BufferTooBig instead of being allocated and
+                        // returned to the pool for later reuse.
+                        pool_type: PoolType::ExclusivePages {
+                            max_alloc_size: u64::MAX,
+                        },
+                        dealloc_period: Some(BASE_DEALLOC_PERIOD),
+                    }))
                     .collect()
             }
             MemoryConfiguration::Custom { pool_options } => pool_options,

@@ -139,14 +139,18 @@ cargo run -p afterburner-cli --features cuda,checkpointing -- `
   --steps 10 --max-resolution 512
 ```
 
-Attention score matrices are computed in 128-query-token chunks by default. This limits
+Attention score matrices are computed in 256-query-token chunks by default. This limits
 each individual score allocation to `chunk_size x context_length` rather than the
 full spatial `sequence_length x context_length` matrix. Checkpointing is
 recommended with this mode for training; chunking alone limits allocation
 peaks but does not guarantee that all backward intermediates are discarded.
-For a smaller GPU, override the chunk size with `AFTERBURNER_ATTENTION_CHUNK`,
-for example `AFTERBURNER_ATTENTION_CHUNK=64`. Smaller chunks reduce peak
-temporary memory at the cost of more kernel launches.
+Override the chunk size with `--attention-chunk`, for example
+`--attention-chunk 128`. Smaller chunks reduce peak temporary memory at the
+cost of more kernel launches.
+
+Long-sequence Matmul backward passes are tiled as well. The default tile is
+512 tokens; use `--matmul-backward-chunk 256` when memory is tight. This is
+applied to both input and weight gradients of sequence-shaped linear layers.
 
 ## Training pipeline
 
@@ -156,10 +160,13 @@ The intended workflow is:
 2. Train the Anima DiT from the cache with Burn.
 3. Export LoRA factors as SafeTensors.
 
-For preprocessing, `--tokenizer` and `--t5-tokenizer` are optional. When they
-are omitted, the CLI searches beside the Qwen text-encoder model, its
-`tokenizer` subdirectory, the model directory's parent, and the directory
-specified by `AFTERBURNER_TOKENIZER_DIR`. Explicit paths always take priority.
+For preprocessing, `--tokenizer` and `--t5-tokenizer` are optional. The
+reference Qwen and T5 tokenizer JSON files are included under
+`assets/tokenizers/`. When the options are omitted, the CLI searches beside
+the Qwen text-encoder model, its `tokenizer` subdirectory, the model
+directory's parent, the bundled `assets/tokenizers/` directory, and the
+directories specified by the tokenizer environment variables. Explicit paths
+always take priority.
 
 Use `--max-resolution` to bound the longest image edge before VAE encoding.
 This is recommended for full-attention GPU training because the DiT attention
@@ -167,9 +174,13 @@ memory grows quadratically with the number of spatial tokens. For example,
 `--max-resolution 512` converts a 1024-pixel-class dataset into a practical
 smoke-test size.
 
-Training can be configured with a JSON file or command-line options. The
-`--flow-matching`, `--weighting-scheme`, and `--max-grad-norm` options expose
-the main Anima training controls.
+Training can be configured with a JSON file or command-line options. Anima
+uses rectified-flow training by default (`target = noise - latents`), with the
+kohya_ss reference flow shift of `3.0` and logit-normal sigma sampling. The
+`--flow-matching`, `--weighting-scheme`, and `--max-grad-norm`
+options expose the main Anima training controls. Set
+`"flow_matching": false` in a JSON config only for legacy epsilon-prediction
+experiments.
 
 The JSON configuration accepts the following training fields (all are
 optional):
@@ -184,6 +195,7 @@ optional):
   "seed": 42,
   "lora_rank": 8,
   "lora_alpha": 16,
+  "attention_chunk": 256,
   "flow_matching": true,
   "device": "cuda",
   "gpu_index": 0,

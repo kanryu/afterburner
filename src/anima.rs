@@ -185,8 +185,14 @@ impl QwenImageVaeConfig {
         if channel_count != self.latent_channels || values.len() % channel_count != 0 {
             return Err("latent data does not match the Qwen Image VAE channel count".into());
         }
+        let channel_plane = values.len() / channel_count;
         for (index, value) in values.iter_mut().enumerate() {
-            let channel = index % channel_count;
+            // VaeTensor stores channel-major NCHW-compatible data.  Python's
+            // `(latent - mean) * (1 / std)` broadcasts over the channel axis;
+            // using index % channel_count would incorrectly treat the buffer
+            // as interleaved and corrupt every spatial position after the
+            // first channel.
+            let channel = index / channel_plane;
             *value = (*value - self.latent_mean[channel]) / self.latent_std[channel];
         }
         Ok(())

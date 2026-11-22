@@ -24,8 +24,14 @@ serde_json = "1"
 default = []
 checkpointing = ["afterburner/checkpointing"]
 bf16 = ["afterburner/bf16"]
+f16 = ["afterburner/f16"]
 vulkan = ["afterburner/vulkan"]
-cuda = ["dep:burn-cuda", "dep:cubecl-core", "dep:cubecl-cuda", "afterburner/cuda"]
+cuda = [
+    "dep:burn-cuda",
+    "dep:cubecl-core",
+    "dep:cubecl-cuda",
+    "afterburner/cuda",
+]
 candle-cuda = ["afterburner/candle-cuda"]
 fixed-memory = ["afterburner/fixed-memory"]
 

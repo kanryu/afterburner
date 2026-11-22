@@ -3,8 +3,8 @@
 use std::{borrow::Cow, collections::HashMap, fs::File, path::Path};
 
 use burn::{
-    module::{Module, ModuleVisitor, Param},
-    tensor::{ElementConversion, Tensor, TensorData, backend::Backend},
+    module::{Module, ModuleDisplay, ModuleVisitor, Param, ParamId},
+    tensor::{DType, ElementConversion, Tensor, TensorData, backend::Backend},
 };
 use half::{bf16, f16};
 use memmap2::MmapOptions;
@@ -12,8 +12,14 @@ use safetensors::{SafeTensors, tensor::Dtype};
 
 use crate::{
     anima::AnimaConfig,
-    dit::AnimaDiT,
-    lora::{LoraConfig, LoraLinear, LoraLinearConfig, LoraTarget, select_anima_target},
+    dit::{
+        AnimaAttentionLayer, AnimaAttentionStandard, AnimaDiT, AnimaDiTBlock, AnimaLlmAdapterBlock,
+        BlockCheckpointBackend,
+    },
+    lora::{
+        LoraConfig, LoraLinear, LoraLinearConfig, LoraTarget, normalize_anima_lora_key,
+        select_anima_target,
+    },
 };
 
 #[derive(Debug)]
@@ -221,15 +227,19 @@ impl AnimaLoadReport {
 }
 
 /// Loads all currently supported Anima parameters into an initialized Burn model.
-pub fn load_anima_weights<B: Backend>(
+pub fn load_anima_weights<B, A>(
     path: impl AsRef<Path>,
-    model: &mut AnimaDiT<B>,
-) -> Result<AnimaLoadReport, WeightError> {
+    model: &mut AnimaDiT<B, A>,
+) -> Result<AnimaLoadReport, WeightError>
+where
+    B: Backend,
+    A: AnimaAttentionLayer<B>,
+{
     let file = File::open(path)?;
     let mapped = unsafe { MmapOptions::new().map(&file) }.map_err(WeightError::Io)?;
     let tensors = SafeTensors::deserialize(&mapped)
         .map_err(|error| WeightError::SafeTensor(error.to_string()))?;
-    let device = model.input_projection.weight.val().device();
+    let device = model.input_projection.weight.lazy_device();
     let show_progress = std::env::var_os("AFTERBURNER_LOAD_PROGRESS").is_some();
     let mut report = AnimaLoadReport::default();
 
@@ -265,14 +275,18 @@ pub fn load_anima_weights<B: Backend>(
                     continue;
                 };
                 let target = match component.as_str() {
-                    "self_attn.q_proj" => Some(&mut block.self_attn.q_proj),
-                    "self_attn.k_proj" => Some(&mut block.self_attn.k_proj),
-                    "self_attn.v_proj" => Some(&mut block.self_attn.v_proj),
-                    "self_attn.output_proj" => Some(&mut block.self_attn.output_proj),
-                    "cross_attn.q_proj" => Some(&mut block.cross_attn.q_proj),
-                    "cross_attn.k_proj" => Some(&mut block.cross_attn.k_proj),
-                    "cross_attn.v_proj" => Some(&mut block.cross_attn.v_proj),
-                    "cross_attn.output_proj" => Some(&mut block.cross_attn.output_proj),
+                    "self_attn.q_proj" => Some(&mut block.self_attn.standard_mut().q_proj),
+                    "self_attn.k_proj" => Some(&mut block.self_attn.standard_mut().k_proj),
+                    "self_attn.v_proj" => Some(&mut block.self_attn.standard_mut().v_proj),
+                    "self_attn.output_proj" => {
+                        Some(&mut block.self_attn.standard_mut().output_proj)
+                    }
+                    "cross_attn.q_proj" => Some(&mut block.cross_attn.standard_mut().q_proj),
+                    "cross_attn.k_proj" => Some(&mut block.cross_attn.standard_mut().k_proj),
+                    "cross_attn.v_proj" => Some(&mut block.cross_attn.standard_mut().v_proj),
+                    "cross_attn.output_proj" => {
+                        Some(&mut block.cross_attn.standard_mut().output_proj)
+                    }
                     "mlp.layer1" => Some(&mut block.mlp_layer1),
                     "mlp.layer2" => Some(&mut block.mlp_layer2),
                     "adaln_modulation_self_attn.1" => Some(&mut block.self_attn_modulation.down),
@@ -283,11 +297,40 @@ pub fn load_anima_weights<B: Backend>(
                     "adaln_modulation_mlp.2" => Some(&mut block.mlp_modulation.up),
                     _ => None,
                 };
-                let Some(target) = target else {
-                    report.skipped.push(key.to_owned());
-                    continue;
-                };
-                load_linear_weight(target, view, key, &device)?
+                if let Some(target) = target {
+                    load_linear_weight(target, view, key, &device)?
+                } else {
+                    match component.as_str() {
+                        "self_attn.q_norm" => load_rms_norm_weight(
+                            &mut block.self_attn.standard_mut().q_norm,
+                            view,
+                            key,
+                            &device,
+                        )?,
+                        "self_attn.k_norm" => load_rms_norm_weight(
+                            &mut block.self_attn.standard_mut().k_norm,
+                            view,
+                            key,
+                            &device,
+                        )?,
+                        "cross_attn.q_norm" => load_rms_norm_weight(
+                            &mut block.cross_attn.standard_mut().q_norm,
+                            view,
+                            key,
+                            &device,
+                        )?,
+                        "cross_attn.k_norm" => load_rms_norm_weight(
+                            &mut block.cross_attn.standard_mut().k_norm,
+                            view,
+                            key,
+                            &device,
+                        )?,
+                        _ => {
+                            report.skipped.push(key.to_owned());
+                            continue;
+                        }
+                    }
+                }
             }
             AnimaWeightSlot::LlmAdapter { index, component } => {
                 let Some(block) = model.llm_adapter.blocks.get_mut(index) else {
@@ -295,30 +338,78 @@ pub fn load_anima_weights<B: Backend>(
                     continue;
                 };
                 match component.as_str() {
-                    "self_attn.q_proj" => {
-                        load_linear_weight(&mut block.self_attn.q_proj, view, key, &device)?
-                    }
-                    "self_attn.k_proj" => {
-                        load_linear_weight(&mut block.self_attn.k_proj, view, key, &device)?
-                    }
-                    "self_attn.v_proj" => {
-                        load_linear_weight(&mut block.self_attn.v_proj, view, key, &device)?
-                    }
-                    "self_attn.o_proj" => {
-                        load_linear_weight(&mut block.self_attn.output_proj, view, key, &device)?
-                    }
-                    "cross_attn.q_proj" => {
-                        load_linear_weight(&mut block.cross_attn.q_proj, view, key, &device)?
-                    }
-                    "cross_attn.k_proj" => {
-                        load_linear_weight(&mut block.cross_attn.k_proj, view, key, &device)?
-                    }
-                    "cross_attn.v_proj" => {
-                        load_linear_weight(&mut block.cross_attn.v_proj, view, key, &device)?
-                    }
-                    "cross_attn.o_proj" => {
-                        load_linear_weight(&mut block.cross_attn.output_proj, view, key, &device)?
-                    }
+                    "self_attn.q_proj" => load_linear_weight(
+                        &mut block.self_attn.standard_mut().q_proj,
+                        view,
+                        key,
+                        &device,
+                    )?,
+                    "self_attn.k_proj" => load_linear_weight(
+                        &mut block.self_attn.standard_mut().k_proj,
+                        view,
+                        key,
+                        &device,
+                    )?,
+                    "self_attn.v_proj" => load_linear_weight(
+                        &mut block.self_attn.standard_mut().v_proj,
+                        view,
+                        key,
+                        &device,
+                    )?,
+                    "self_attn.o_proj" => load_linear_weight(
+                        &mut block.self_attn.standard_mut().output_proj,
+                        view,
+                        key,
+                        &device,
+                    )?,
+                    "cross_attn.q_proj" => load_linear_weight(
+                        &mut block.cross_attn.standard_mut().q_proj,
+                        view,
+                        key,
+                        &device,
+                    )?,
+                    "cross_attn.k_proj" => load_linear_weight(
+                        &mut block.cross_attn.standard_mut().k_proj,
+                        view,
+                        key,
+                        &device,
+                    )?,
+                    "cross_attn.v_proj" => load_linear_weight(
+                        &mut block.cross_attn.standard_mut().v_proj,
+                        view,
+                        key,
+                        &device,
+                    )?,
+                    "self_attn.q_norm" => load_rms_norm_weight(
+                        &mut block.self_attn.standard_mut().q_norm,
+                        view,
+                        key,
+                        &device,
+                    )?,
+                    "self_attn.k_norm" => load_rms_norm_weight(
+                        &mut block.self_attn.standard_mut().k_norm,
+                        view,
+                        key,
+                        &device,
+                    )?,
+                    "cross_attn.q_norm" => load_rms_norm_weight(
+                        &mut block.cross_attn.standard_mut().q_norm,
+                        view,
+                        key,
+                        &device,
+                    )?,
+                    "cross_attn.k_norm" => load_rms_norm_weight(
+                        &mut block.cross_attn.standard_mut().k_norm,
+                        view,
+                        key,
+                        &device,
+                    )?,
+                    "cross_attn.o_proj" => load_linear_weight(
+                        &mut block.cross_attn.standard_mut().output_proj,
+                        view,
+                        key,
+                        &device,
+                    )?,
                     "mlp.0" => load_linear_weight(&mut block.mlp_layer1, view, key, &device)?,
                     "mlp.0.bias" => load_linear_bias(&mut block.mlp_layer1, view, key, &device)?,
                     "mlp.2" => load_linear_weight(&mut block.mlp_layer2, view, key, &device)?,
@@ -373,14 +464,27 @@ pub fn load_anima_weights<B: Backend>(
 }
 
 /// Initializes the default Anima architecture and loads its base checkpoint.
-pub fn load_anima_model<B: Backend>(
+pub fn load_anima_model<B: Backend + BlockCheckpointBackend>(
     path: impl AsRef<Path>,
     lora: &LoraConfig,
     device: &B::Device,
 ) -> Result<(AnimaDiT<B>, AnimaLoadReport), WeightError> {
+    load_anima_model_with_attention::<B, AnimaAttentionStandard<B>>(path, lora, device)
+}
+
+/// Initializes Anima with an explicitly selected attention implementation.
+pub fn load_anima_model_with_attention<B, A>(
+    path: impl AsRef<Path>,
+    lora: &LoraConfig,
+    device: &B::Device,
+) -> Result<(AnimaDiT<B, A>, AnimaLoadReport), WeightError>
+where
+    B: Backend + BlockCheckpointBackend,
+    A: AnimaAttentionLayer<B>,
+{
     let started = std::time::Instant::now();
     eprintln!("[load] AnimaDiT initialization started");
-    let mut model = AnimaDiT::init(&AnimaConfig::default(), lora, device)
+    let mut model = AnimaDiT::<B, A>::init(&AnimaConfig::default(), lora, device)
         .map_err(|error| WeightError::Lora(error.to_string()))?;
     eprintln!(
         "[load] AnimaDiT initialization finished in {:.3}s; loading SafeTensors",
@@ -398,30 +502,64 @@ pub fn load_anima_model<B: Backend>(
 }
 
 /// Loads an Afterburner-exported LoRA file into an initialized Anima model.
-pub fn load_anima_lora_factors<B: Backend>(
+pub fn load_anima_lora_factors<B, A>(
     path: impl AsRef<Path>,
-    model: &mut AnimaDiT<B>,
-) -> Result<usize, WeightError> {
+    model: &mut AnimaDiT<B, A>,
+) -> Result<usize, WeightError>
+where
+    B: Backend,
+    A: AnimaAttentionLayer<B>,
+{
     let file = File::open(path)?;
     let mapped = unsafe { MmapOptions::new().map(&file) }.map_err(WeightError::Io)?;
     let tensors = SafeTensors::deserialize(&mapped)
         .map_err(|error| WeightError::SafeTensor(error.to_string()))?;
-    let device = model.input_projection.weight.val().device();
+    let device = model.input_projection.weight.lazy_device();
     let mut loaded = 0;
     for (key, view) in tensors.iter() {
-        let Some(key) = key
-            .strip_prefix("diffusion_model.")
-            .or_else(|| key.strip_prefix("model.diffusion_model."))
-        else {
+        let Some((target_name, factor)) = normalize_lora_factor_key(key) else {
             continue;
         };
-        let Some((target_name, factor)) = key
-            .strip_suffix(".weight")
-            .and_then(|key| key.rsplit_once(".lora_"))
-        else {
+        let Some(target) = lora_target_mut(model, &target_name) else {
             continue;
         };
-        let target_name = match target_name {
+        if factor != "down" && factor != "up" {
+            continue;
+        }
+        let expected = if factor == "down" {
+            target.lora_down.lazy_shape().dims
+        } else {
+            target.lora_up.lazy_shape().dims
+        };
+        ensure_shape(key, view.shape(), &expected)?;
+        // Python kohya keeps LoRA parameters in FP32 unless full_fp16 or
+        // full_bf16 is explicitly requested. The model activation dtype is
+        // selected independently at forward time, so do not let the CUDA
+        // backend's default dtype silently quantize these trainable factors.
+        // Materialize a fresh FP32 leaf; the forward path casts only the
+        // operands used by the low-precision projection.
+        let tensor = load_tensor::<B, 2>(view, key, &device)?.cast(DType::F32);
+        if factor == "down" {
+            target.lora_down = Param::from_tensor(tensor);
+        } else {
+            target.lora_up = Param::from_tensor(tensor);
+        }
+        loaded += 1;
+    }
+    Ok(loaded)
+}
+
+fn normalize_lora_factor_key(key: &str) -> Option<(String, String)> {
+    let key = key.strip_suffix(".weight")?;
+    let (target, factor) = key.rsplit_once(".lora_")?;
+    if factor != "down" && factor != "up" {
+        return None;
+    }
+    if let Some(target) = target
+        .strip_prefix("diffusion_model.")
+        .or_else(|| target.strip_prefix("model.diffusion_model."))
+    {
+        let target = match target {
             name if name.ends_with(".mlp.layer1") => {
                 format!("{}mlp_layer1", &name[..name.len() - ".mlp.layer1".len()])
             }
@@ -436,33 +574,48 @@ pub fn load_anima_lora_factors<B: Backend>(
             }
             name => name.to_owned(),
         };
-        let Some(target) = lora_target_mut(model, &target_name) else {
-            continue;
-        };
-        if factor != "down" && factor != "up" {
-            continue;
-        }
-        let expected = if factor == "down" {
-            target.lora_down.val().dims()
-        } else {
-            target.lora_up.val().dims()
-        };
-        ensure_shape(key, view.shape(), &expected)?;
-        let tensor = load_tensor::<B, 2>(view, key, &device)?;
-        if factor == "down" {
-            target.lora_down = Param::from_tensor(tensor);
-        } else {
-            target.lora_up = Param::from_tensor(tensor);
-        }
-        loaded += 1;
+        return Some((target, factor.to_owned()));
     }
-    Ok(loaded)
+    let target = target.strip_prefix("lora_unet_")?;
+    let target = if let Some(rest) = target.strip_prefix("blocks_") {
+        let (index, component) = rest.split_once('_')?;
+        format!("blocks.{index}.{}", flatten_lora_component(component)?)
+    } else if let Some(rest) = target.strip_prefix("llm_adapter_blocks_") {
+        let (index, component) = rest.split_once('_')?;
+        format!(
+            "llm_adapter.blocks.{index}.{}",
+            flatten_lora_component(component)?
+        )
+    } else {
+        return None;
+    };
+    Some((target, factor.to_owned()))
 }
 
-fn lora_target_mut<'a, B: Backend>(
-    model: &'a mut AnimaDiT<B>,
+fn flatten_lora_component(component: &str) -> Option<&'static str> {
+    match component {
+        "self_attn_q_proj" => Some("self_attn.q_proj"),
+        "self_attn_k_proj" => Some("self_attn.k_proj"),
+        "self_attn_v_proj" => Some("self_attn.v_proj"),
+        "self_attn_output_proj" => Some("self_attn.output_proj"),
+        "cross_attn_q_proj" => Some("cross_attn.q_proj"),
+        "cross_attn_k_proj" => Some("cross_attn.k_proj"),
+        "cross_attn_v_proj" => Some("cross_attn.v_proj"),
+        "cross_attn_output_proj" => Some("cross_attn.output_proj"),
+        "mlp_layer1" => Some("mlp_layer1"),
+        "mlp_layer2" => Some("mlp_layer2"),
+        _ => None,
+    }
+}
+
+fn lora_target_mut<'a, B, A>(
+    model: &'a mut AnimaDiT<B, A>,
     name: &str,
-) -> Option<&'a mut LoraLinear<B>> {
+) -> Option<&'a mut LoraLinear<B>>
+where
+    B: Backend,
+    A: AnimaAttentionLayer<B>,
+{
     if name == "input_projection" {
         return Some(&mut model.input_projection);
     }
@@ -506,19 +659,23 @@ fn lora_target_mut<'a, B: Backend>(
     None
 }
 
-fn block_lora_target_mut<'a, B: Backend>(
-    block: &'a mut crate::dit::AnimaDiTBlock<B>,
+fn block_lora_target_mut<'a, B, A>(
+    block: &'a mut AnimaDiTBlock<B, A>,
     component: &str,
-) -> Option<&'a mut LoraLinear<B>> {
+) -> Option<&'a mut LoraLinear<B>>
+where
+    B: Backend,
+    A: AnimaAttentionLayer<B>,
+{
     match component {
-        "self_attn.q_proj" => Some(&mut block.self_attn.q_proj),
-        "self_attn.k_proj" => Some(&mut block.self_attn.k_proj),
-        "self_attn.v_proj" => Some(&mut block.self_attn.v_proj),
-        "self_attn.output_proj" => Some(&mut block.self_attn.output_proj),
-        "cross_attn.q_proj" => Some(&mut block.cross_attn.q_proj),
-        "cross_attn.k_proj" => Some(&mut block.cross_attn.k_proj),
-        "cross_attn.v_proj" => Some(&mut block.cross_attn.v_proj),
-        "cross_attn.output_proj" => Some(&mut block.cross_attn.output_proj),
+        "self_attn.q_proj" => Some(&mut block.self_attn.standard_mut().q_proj),
+        "self_attn.k_proj" => Some(&mut block.self_attn.standard_mut().k_proj),
+        "self_attn.v_proj" => Some(&mut block.self_attn.standard_mut().v_proj),
+        "self_attn.output_proj" => Some(&mut block.self_attn.standard_mut().output_proj),
+        "cross_attn.q_proj" => Some(&mut block.cross_attn.standard_mut().q_proj),
+        "cross_attn.k_proj" => Some(&mut block.cross_attn.standard_mut().k_proj),
+        "cross_attn.v_proj" => Some(&mut block.cross_attn.standard_mut().v_proj),
+        "cross_attn.output_proj" => Some(&mut block.cross_attn.standard_mut().output_proj),
         "mlp_layer1" => Some(&mut block.mlp_layer1),
         "mlp_layer2" => Some(&mut block.mlp_layer2),
         "self_attn_modulation.down" => Some(&mut block.self_attn_modulation.down),
@@ -531,19 +688,23 @@ fn block_lora_target_mut<'a, B: Backend>(
     }
 }
 
-fn adapter_lora_target_mut<'a, B: Backend>(
-    block: &'a mut crate::dit::AnimaLlmAdapterBlock<B>,
+fn adapter_lora_target_mut<'a, B, A>(
+    block: &'a mut AnimaLlmAdapterBlock<B, A>,
     component: &str,
-) -> Option<&'a mut LoraLinear<B>> {
+) -> Option<&'a mut LoraLinear<B>>
+where
+    B: Backend,
+    A: AnimaAttentionLayer<B>,
+{
     match component {
-        "self_attn.q_proj" => Some(&mut block.self_attn.q_proj),
-        "self_attn.k_proj" => Some(&mut block.self_attn.k_proj),
-        "self_attn.v_proj" => Some(&mut block.self_attn.v_proj),
-        "self_attn.output_proj" => Some(&mut block.self_attn.output_proj),
-        "cross_attn.q_proj" => Some(&mut block.cross_attn.q_proj),
-        "cross_attn.k_proj" => Some(&mut block.cross_attn.k_proj),
-        "cross_attn.v_proj" => Some(&mut block.cross_attn.v_proj),
-        "cross_attn.output_proj" => Some(&mut block.cross_attn.output_proj),
+        "self_attn.q_proj" => Some(&mut block.self_attn.standard_mut().q_proj),
+        "self_attn.k_proj" => Some(&mut block.self_attn.standard_mut().k_proj),
+        "self_attn.v_proj" => Some(&mut block.self_attn.standard_mut().v_proj),
+        "self_attn.output_proj" => Some(&mut block.self_attn.standard_mut().output_proj),
+        "cross_attn.q_proj" => Some(&mut block.cross_attn.standard_mut().q_proj),
+        "cross_attn.k_proj" => Some(&mut block.cross_attn.standard_mut().k_proj),
+        "cross_attn.v_proj" => Some(&mut block.cross_attn.standard_mut().v_proj),
+        "cross_attn.output_proj" => Some(&mut block.cross_attn.standard_mut().output_proj),
         "mlp_layer1" => Some(&mut block.mlp_layer1),
         "mlp_layer2" => Some(&mut block.mlp_layer2),
         _ => None,
@@ -556,8 +717,13 @@ fn load_linear_weight<B: Backend>(
     key: &str,
     device: &B::Device,
 ) -> Result<bool, WeightError> {
-    ensure_shape(key, view.shape(), &target.weight.val().dims())?;
-    target.weight = Param::from_tensor(load_tensor::<B, 2>(view, key, device)?);
+    ensure_shape(key, view.shape(), &target.weight.lazy_shape().dims)?;
+    // Base weights are frozen during LoRA training.  Do not create a
+    // require-grad Autodiff leaf and detach it afterwards: that transient
+    // leaf can keep the initialization allocation alive on CUDA.  Install a
+    // detached tensor directly as a non-trainable parameter.
+    let tensor = load_tensor::<B, 2>(view, key, device)?.cast(base_weight_dtype()).detach();
+    target.weight = Param::initialized(ParamId::new(), tensor);
     Ok(true)
 }
 
@@ -575,9 +741,10 @@ fn load_linear_bias<B: Backend>(
     ensure_shape(
         key,
         view.shape(),
-        &target.bias.as_ref().unwrap().val().dims(),
+        &target.bias.as_ref().unwrap().lazy_shape().dims,
     )?;
-    target.bias = Some(Param::from_tensor(load_tensor::<B, 1>(view, key, device)?));
+    let tensor = load_tensor::<B, 1>(view, key, device)?.cast(base_weight_dtype()).detach();
+    target.bias = Some(Param::initialized(ParamId::new(), tensor));
     Ok(true)
 }
 
@@ -587,8 +754,9 @@ fn load_rms_norm_weight<B: Backend>(
     key: &str,
     device: &B::Device,
 ) -> Result<bool, WeightError> {
-    ensure_shape(key, view.shape(), &target.gamma.val().dims())?;
-    target.gamma = Param::from_tensor(load_tensor::<B, 1>(view, key, device)?);
+    ensure_shape(key, view.shape(), &target.gamma.lazy_shape().dims)?;
+    let tensor = load_tensor::<B, 1>(view, key, device)?.cast(base_weight_dtype()).detach();
+    target.gamma = Param::initialized(ParamId::new(), tensor);
     Ok(true)
 }
 
@@ -598,8 +766,9 @@ fn load_embedding_weight<B: Backend>(
     key: &str,
     device: &B::Device,
 ) -> Result<bool, WeightError> {
-    ensure_shape(key, view.shape(), &target.weight.val().dims())?;
-    target.weight = Param::from_tensor(load_tensor::<B, 2>(view, key, device)?);
+    ensure_shape(key, view.shape(), &target.weight.lazy_shape().dims)?;
+    let tensor = load_tensor::<B, 2>(view, key, device)?.cast(base_weight_dtype()).detach();
+    target.weight = Param::initialized(ParamId::new(), tensor);
     Ok(true)
 }
 
@@ -612,6 +781,19 @@ fn ensure_shape(key: &str, actual: &[usize], expected: &[usize]) -> Result<(), W
             expected: expected.to_vec(),
             actual: actual.to_vec(),
         })
+    }
+}
+
+fn base_weight_dtype() -> DType {
+    // Base parameters are frozen for LoRA training and never need an FP32
+    // master copy.  Keeping the two-billion-parameter base in F32 doubles
+    // its resident VRAM and causes every fused projection to cast a much
+    // larger tensor.  BF16 is the training representation used by the CUDA
+    // path; retain the environment switch as an explicit compatibility knob.
+    if std::env::var_os("AFTERBURNER_BASE_F32").is_some() {
+        DType::F32
+    } else {
+        DType::BF16
     }
 }
 
@@ -687,6 +869,7 @@ struct OwnedTensorView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoraOutputDtype {
     F32,
+    F16,
     BF16,
 }
 
@@ -755,10 +938,22 @@ impl<B: Backend> ModuleVisitor<B> for LoraCollector<B> {
         if path.len() < 3 || path[0] != "blocks" {
             return;
         }
-        let internal_module = match path[2..path.len() - 1].join(".").as_str() {
+        // The CUDA attention implementation wraps the portable attention
+        // module in an additional `standard` field.  That implementation
+        // detail must not change the logical LoRA target name used by
+        // kohya_ss/ComfyUI.  Normalize both the portable path
+        // (`blocks.0.self_attn.q_proj`) and the CUDA path
+        // (`blocks.0.self_attn.standard.q_proj`) to the same target.
+        let logical_path = path[2..path.len() - 1]
+            .iter()
+            .filter(|component| component.as_str() != "standard")
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(".");
+        let internal_module = match logical_path.as_str() {
             "mlp_layer1" => "mlp.layer1".to_owned(),
             "mlp_layer2" => "mlp.layer2".to_owned(),
-            value => value.to_owned(),
+            value => value.replace(".standard.", "."),
         };
         if !self
             .target_modules
@@ -777,12 +972,26 @@ impl<B: Backend> ModuleVisitor<B> for LoraCollector<B> {
         let key_base = format!("lora_unet_{target_key}");
         let key = format!("{key_base}.{name}.weight");
         if name == "lora_down" {
+            let (alpha_dtype, alpha_data) = match self.output_dtype {
+                LoraOutputDtype::F32 => (Dtype::F32, self.alpha.to_le_bytes().to_vec()),
+                // kohya_ss emits alpha in the same storage dtype as the LoRA
+                // factors.  Keeping BF16 alpha avoids a dtype-only mismatch
+                // with otherwise identical Anima adapters in ComfyUI.
+                LoraOutputDtype::BF16 => (
+                    Dtype::BF16,
+                    bf16::from_f32(self.alpha).to_le_bytes().to_vec(),
+                ),
+                LoraOutputDtype::F16 => (
+                    Dtype::F16,
+                    f16::from_f32(self.alpha).to_le_bytes().to_vec(),
+                ),
+            };
             self.tensors.push((
                 format!("{key_base}.alpha"),
                 OwnedTensorView {
-                    dtype: Dtype::F32,
+                    dtype: alpha_dtype,
                     shape: Vec::new(),
-                    data: self.alpha.to_le_bytes().to_vec(),
+                    data: alpha_data,
                 },
             ));
         }
@@ -794,6 +1003,7 @@ impl<B: Backend> ModuleVisitor<B> for LoraCollector<B> {
                 .flat_map(|value| match self.output_dtype {
                     LoraOutputDtype::F32 => value.to_le_bytes().to_vec(),
                     LoraOutputDtype::BF16 => bf16::from_f32(value).to_le_bytes().to_vec(),
+                    LoraOutputDtype::F16 => f16::from_f32(value).to_le_bytes().to_vec(),
                 })
                 .collect(),
             Err(error) => {
@@ -807,6 +1017,7 @@ impl<B: Backend> ModuleVisitor<B> for LoraCollector<B> {
                 dtype: match self.output_dtype {
                     LoraOutputDtype::F32 => Dtype::F32,
                     LoraOutputDtype::BF16 => Dtype::BF16,
+                    LoraOutputDtype::F16 => Dtype::F16,
                 },
                 shape: tensor.dims().to_vec(),
                 data,
@@ -840,6 +1051,21 @@ pub fn export_anima_lora_with_config_and_dtype<B: Backend>(
     lora: &LoraConfig,
     output_dtype: LoraOutputDtype,
 ) -> Result<usize, WeightError> {
+    export_anima_lora_with_config_and_dtype_with_attention(path, model, lora, output_dtype)
+}
+
+/// Generic counterpart used when the runtime selects a specialized
+/// attention implementation, such as the CUDA fused boundary.
+pub fn export_anima_lora_with_config_and_dtype_with_attention<B, A>(
+    path: impl AsRef<Path>,
+    model: &AnimaDiT<B, A>,
+    lora: &LoraConfig,
+    output_dtype: LoraOutputDtype,
+) -> Result<usize, WeightError>
+where
+    B: Backend,
+    A: Module<B> + ModuleDisplay,
+{
     lora.validate()
         .map_err(|error| WeightError::Export(error.to_string()))?;
     let mut collector = LoraCollector::<B>::new(lora, output_dtype);
@@ -858,11 +1084,23 @@ pub fn export_anima_lora_with_config_and_dtype<B: Backend>(
     let mut metadata = HashMap::new();
     metadata.insert("format".into(), "afterburner-anima-lora-v1".into());
     metadata.insert("base_model".into(), "anima".into());
+    // Emit the standard Anima/kohya_ss model-spec fields as well.  ComfyUI
+    // can load the tensor keys without them, but the fields make the adapter
+    // unambiguous to loaders that select the network implementation and
+    // scaling from SafeTensors metadata.
+    metadata.insert("modelspec.architecture".into(), "anima-preview/lora".into());
+    metadata.insert("modelspec.sai_model_spec".into(), "1.0.1".into());
+    metadata.insert("ss_base_model_version".into(), "anima".into());
+    metadata.insert("ss_network_module".into(), "networks.lora_anima".into());
+    metadata.insert("ss_network_dim".into(), lora.rank.to_string());
+    metadata.insert("ss_network_alpha".into(), lora.alpha.to_string());
+    metadata.insert("ss_unet_lr".into(), "0.0001".into());
     metadata.insert(
         "dtype".into(),
         match output_dtype {
             LoraOutputDtype::F32 => "F32".into(),
             LoraOutputDtype::BF16 => "BF16".into(),
+            LoraOutputDtype::F16 => "F16".into(),
         },
     );
     safetensors::serialize_to_file(collector.tensors, Some(metadata), path.as_ref())
@@ -880,6 +1118,10 @@ pub struct AnimaLoraPlan {
 pub struct AnimaLoraFactorPlan {
     pub keys: Vec<String>,
     pub parameter_count: usize,
+    pub f32_tensors: usize,
+    pub bf16_tensors: usize,
+    pub f16_tensors: usize,
+    pub storage_bytes: usize,
 }
 
 impl AnimaLoraFactorPlan {
@@ -909,6 +1151,13 @@ pub fn inspect_anima_lora_factors(
             });
         }
         plan.parameter_count += view.shape().iter().product::<usize>();
+        match view.dtype() {
+            Dtype::F32 => plan.f32_tensors += 1,
+            Dtype::BF16 => plan.bf16_tensors += 1,
+            Dtype::F16 => plan.f16_tensors += 1,
+            _ => {}
+        }
+        plan.storage_bytes += view.data().len();
         plan.keys.push(key.to_owned());
     }
     plan.keys.sort();
@@ -937,12 +1186,56 @@ pub fn inspect_anima_lora_file(
     let tensors = SafeTensors::deserialize(&mapped)
         .map_err(|error| WeightError::SafeTensor(error.to_string()))?;
     let mut targets = Vec::new();
+    let mut factors: HashMap<String, (Option<Vec<usize>>, Option<Vec<usize>>)> = HashMap::new();
     for (key, view) in tensors.iter() {
+        if let Some(target) = normalize_anima_lora_key(key)
+            && (key.ends_with(".lora_down.weight") || key.ends_with(".lora_up.weight"))
+        {
+            if view.shape().len() != 2 {
+                return Err(WeightError::InvalidRank {
+                    key: key.to_owned(),
+                    expected: 2,
+                    actual: view.shape().len(),
+                });
+            }
+            let entry = factors.entry(target).or_default();
+            if key.ends_with(".lora_down.weight") {
+                entry.0 = Some(view.shape().to_vec());
+            } else {
+                entry.1 = Some(view.shape().to_vec());
+            }
+            continue;
+        }
         if let Some(target) = select_anima_target(key, view.shape(), lora)
             .map_err(|error| WeightError::Lora(error.to_string()))?
         {
             targets.push(target);
         }
+    }
+    for (key, (down, up)) in factors {
+        let Some(down) = down else {
+            return Err(WeightError::MissingTensor(format!(
+                "{key}.lora_down.weight"
+            )));
+        };
+        let Some(up) = up else {
+            return Err(WeightError::MissingTensor(format!("{key}.lora_up.weight")));
+        };
+        if down[0] != up[1] {
+            return Err(WeightError::ShapeMismatch {
+                key,
+                expected: vec![down[0], down[1]],
+                actual: up,
+            });
+        }
+        targets.push(LoraTarget {
+            key,
+            kind: crate::lora::LoraTargetKind::Linear,
+            output_dim: up[0],
+            input_dim: down[1],
+            rank: down[0],
+            alpha: lora.alpha,
+        });
     }
     targets.sort_by(|left, right| left.key.cmp(&right.key));
     Ok(AnimaLoraPlan { targets })
@@ -990,8 +1283,12 @@ pub fn load_anima_lora_linear<B: Backend>(
     }
     .init::<B>(device)
     .map_err(|error| WeightError::Lora(error.to_string()))?;
-    let base = Tensor::from_data(TensorData::new(values, [*output_dim, *input_dim]), device);
-    layer.weight = Param::from_tensor(base);
+    let base = Tensor::<B, 2>::from_data(
+        TensorData::new(values, [*output_dim, *input_dim]),
+        device,
+    );
+    let base = Tensor::<B, 2>::cast(base, DType::F32);
+    layer.weight = Param::from_tensor(base).map(|tensor| tensor.detach());
     Ok(layer)
 }
 
@@ -1051,6 +1348,64 @@ mod tests {
     }
 
     #[test]
+    fn maps_rms_norm_weights_for_dit_and_llm_adapter_blocks() {
+        let keys = [
+            (
+                "model.diffusion_model.blocks.0.self_attn.q_norm.weight",
+                AnimaWeightSlot::Block {
+                    index: 0,
+                    component: "self_attn.q_norm".to_owned(),
+                },
+            ),
+            (
+                "model.diffusion_model.blocks.27.cross_attn.k_norm.weight",
+                AnimaWeightSlot::Block {
+                    index: 27,
+                    component: "cross_attn.k_norm".to_owned(),
+                },
+            ),
+            (
+                "model.diffusion_model.llm_adapter.blocks.0.self_attn.q_norm.weight",
+                AnimaWeightSlot::LlmAdapter {
+                    index: 0,
+                    component: "self_attn.q_norm".to_owned(),
+                },
+            ),
+            (
+                "net.llm_adapter.blocks.5.cross_attn.k_norm.weight",
+                AnimaWeightSlot::LlmAdapter {
+                    index: 5,
+                    component: "cross_attn.k_norm".to_owned(),
+                },
+            ),
+        ];
+        for (key, expected) in keys {
+            assert_eq!(map_anima_weight_key(key), Some(expected), "key={key}");
+        }
+    }
+
+    #[test]
+    fn normalizes_comfyui_lora_unet_factor_keys() {
+        assert_eq!(
+            normalize_lora_factor_key("lora_unet_blocks_0_self_attn_q_proj.lora_down.weight"),
+            Some(("blocks.0.self_attn.q_proj".to_owned(), "down".to_owned()))
+        );
+        assert_eq!(
+            normalize_lora_factor_key(
+                "lora_unet_llm_adapter_blocks_5_cross_attn_output_proj.lora_up.weight"
+            ),
+            Some((
+                "llm_adapter.blocks.5.cross_attn.output_proj".to_owned(),
+                "up".to_owned()
+            ))
+        );
+        assert_eq!(
+            normalize_lora_factor_key("lora_unet_blocks_0_unknown.lora_up.weight"),
+            None
+        );
+    }
+
+    #[test]
     fn rejects_weight_shape_mismatch_before_tensor_creation() {
         let error = ensure_shape("layer.weight", &[3, 4], &[2, 4]).unwrap_err();
         assert!(matches!(error, WeightError::ShapeMismatch { .. }));
@@ -1078,5 +1433,243 @@ mod tests {
         collector.enter_module("lora_down", "Param");
         collector.visit_float(&layer.lora_down);
         assert_eq!(collector.tensors.len(), 2);
+    }
+
+    #[test]
+    fn inspects_lora_safetensors_factors_and_ignores_metadata() {
+        let path = std::env::temp_dir().join(format!(
+            "afterburner-lora-roundtrip-{}.safetensors",
+            std::process::id()
+        ));
+        let down = vec![0.1_f32, 0.2, 0.3, 0.4];
+        let up = vec![0.5_f32, 0.6, 0.7, 0.8];
+        let down_bytes: Vec<u8> = down.iter().flat_map(|value| value.to_le_bytes()).collect();
+        let up_bytes: Vec<u8> = up.iter().flat_map(|value| value.to_le_bytes()).collect();
+        let tensors = vec![
+            (
+                "lora_unet_blocks_0_self_attn_q_proj.lora_down.weight".to_owned(),
+                safetensors::tensor::TensorView::new(Dtype::F32, vec![1, 4], &down_bytes).unwrap(),
+            ),
+            (
+                "lora_unet_blocks_0_self_attn_q_proj.lora_up.weight".to_owned(),
+                safetensors::tensor::TensorView::new(Dtype::F32, vec![4, 1], &up_bytes).unwrap(),
+            ),
+        ];
+        safetensors::serialize_to_file(tensors, None, &path).unwrap();
+        let plan = inspect_anima_lora_factors(&path).unwrap();
+        assert_eq!(plan.tensor_count(), 2);
+        assert_eq!(plan.parameter_count, 8);
+        assert_eq!(plan.f32_tensors, 2);
+        assert_eq!(plan.bf16_tensors, 0);
+        assert_eq!(plan.storage_bytes, 32);
+        assert!(plan.keys.iter().all(|key| key.ends_with(".weight")));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn inspects_comfyui_lora_factor_pair_as_one_target() {
+        let path = std::env::temp_dir().join(format!(
+            "afterburner-lora-plan-{}.safetensors",
+            std::process::id()
+        ));
+        let down_bytes = vec![0_u8; 2 * 4 * 4];
+        let up_bytes = vec![0_u8; 8 * 2 * 4];
+        let tensors = vec![
+            (
+                "lora_unet_blocks_0_self_attn_q_proj.lora_down.weight".to_owned(),
+                safetensors::tensor::TensorView::new(Dtype::F32, vec![2, 4], &down_bytes).unwrap(),
+            ),
+            (
+                "lora_unet_blocks_0_self_attn_q_proj.lora_up.weight".to_owned(),
+                safetensors::tensor::TensorView::new(Dtype::F32, vec![8, 2], &up_bytes).unwrap(),
+            ),
+        ];
+        safetensors::serialize_to_file(tensors, None, &path).unwrap();
+
+        let mut config = LoraConfig::default();
+        config.rank = 2;
+        config.alpha = 2;
+        let plan = inspect_anima_lora_file(&path, &config).unwrap();
+        assert_eq!(plan.target_count(), 1);
+        assert_eq!(plan.parameter_count(), 24);
+        assert_eq!(plan.targets[0].key, "blocks.0.self_attn.q_proj");
+        assert_eq!(plan.targets[0].rank, 2);
+        assert_eq!(
+            (plan.targets[0].output_dim, plan.targets[0].input_dim),
+            (8, 4)
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_incomplete_comfyui_lora_factor_pair() {
+        let path = std::env::temp_dir().join(format!(
+            "afterburner-lora-incomplete-{}.safetensors",
+            std::process::id()
+        ));
+        let data = vec![0_u8; 2 * 4 * 4];
+        let tensors = vec![(
+            "lora_unet_blocks_0_self_attn_q_proj.lora_down.weight".to_owned(),
+            safetensors::tensor::TensorView::new(Dtype::F32, vec![2, 4], &data).unwrap(),
+        )];
+        safetensors::serialize_to_file(tensors, None, &path).unwrap();
+        let error = inspect_anima_lora_file(&path, &LoraConfig::default()).unwrap_err();
+        assert!(
+            matches!(error, WeightError::MissingTensor(key) if key.ends_with(".lora_up.weight"))
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_comfyui_lora_factor_rank_mismatch() {
+        let path = std::env::temp_dir().join(format!(
+            "afterburner-lora-rank-mismatch-{}.safetensors",
+            std::process::id()
+        ));
+        let down = vec![0_u8; 2 * 4 * 4];
+        let up = vec![0_u8; 8 * 3 * 4];
+        let tensors = vec![
+            (
+                "lora_unet_blocks_0_self_attn_q_proj.lora_down.weight".to_owned(),
+                safetensors::tensor::TensorView::new(Dtype::F32, vec![2, 4], &down).unwrap(),
+            ),
+            (
+                "lora_unet_blocks_0_self_attn_q_proj.lora_up.weight".to_owned(),
+                safetensors::tensor::TensorView::new(Dtype::F32, vec![8, 3], &up).unwrap(),
+            ),
+        ];
+        safetensors::serialize_to_file(tensors, None, &path).unwrap();
+        let error = inspect_anima_lora_file(&path, &LoraConfig::default()).unwrap_err();
+        assert!(matches!(error, WeightError::ShapeMismatch { .. }));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reports_bfloat16_lora_storage_size() {
+        let path = std::env::temp_dir().join(format!(
+            "afterburner-lora-bf16-stats-{}.safetensors",
+            std::process::id()
+        ));
+        let down = vec![0_u8; 2 * 4 * 2];
+        let up = vec![0_u8; 8 * 2 * 2];
+        let tensors = vec![
+            (
+                "lora_unet_blocks_0_self_attn_q_proj.lora_down.weight".to_owned(),
+                safetensors::tensor::TensorView::new(Dtype::BF16, vec![2, 4], &down).unwrap(),
+            ),
+            (
+                "lora_unet_blocks_0_self_attn_q_proj.lora_up.weight".to_owned(),
+                safetensors::tensor::TensorView::new(Dtype::BF16, vec![8, 2], &up).unwrap(),
+            ),
+        ];
+        safetensors::serialize_to_file(tensors, None, &path).unwrap();
+        let plan = inspect_anima_lora_factors(&path).unwrap();
+        assert_eq!(plan.tensor_count(), 2);
+        assert_eq!(plan.parameter_count, 24);
+        assert_eq!(plan.bf16_tensors, 2);
+        assert_eq!(plan.f32_tensors, 0);
+        assert_eq!(plan.storage_bytes, 48);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn loads_comfyui_lora_factors_into_small_anima_model() {
+        type Backend = burn_ndarray::NdArray<f32>;
+        let device = <Backend as burn::tensor::backend::Backend>::Device::default();
+        let config = AnimaConfig {
+            block_count: 1,
+            hidden_size: 16,
+            text_hidden_size: 16,
+            attention_head_count: 1,
+            attention_head_size: 16,
+            mlp_hidden_size: 32,
+            input_channels: 4,
+            output_channels: 4,
+            llm_adapter_block_count: 1,
+            llm_adapter_hidden_size: 1024,
+            text_vocab_size: 32,
+        };
+        let mut lora = LoraConfig::default();
+        lora.rank = 1;
+        lora.alpha = 1;
+        let mut model: AnimaDiT<Backend> = AnimaDiT::init(&config, &lora, &device).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "afterburner-lora-load-{}.safetensors",
+            std::process::id()
+        ));
+        let down = vec![1.0_f32; 16];
+        let up = vec![2.0_f32; 16];
+        let down_bytes: Vec<u8> = down.iter().flat_map(|value| value.to_le_bytes()).collect();
+        let up_bytes: Vec<u8> = up.iter().flat_map(|value| value.to_le_bytes()).collect();
+        let tensors = vec![
+            (
+                "lora_unet_blocks_0_self_attn_q_proj.lora_down.weight".to_owned(),
+                safetensors::tensor::TensorView::new(Dtype::F32, vec![1, 16], &down_bytes).unwrap(),
+            ),
+            (
+                "lora_unet_blocks_0_self_attn_q_proj.lora_up.weight".to_owned(),
+                safetensors::tensor::TensorView::new(Dtype::F32, vec![16, 1], &up_bytes).unwrap(),
+            ),
+        ];
+        safetensors::serialize_to_file(tensors, None, &path).unwrap();
+        assert_eq!(load_anima_lora_factors(&path, &mut model).unwrap(), 2);
+        let down_values = model.blocks[0]
+            .self_attn
+            .q_proj
+            .lora_down
+            .val()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(down_values, down);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "reads the full Anima checkpoint; set AFTERBURNER_ANIMA_PATH to run"]
+    fn anima_checkpoint_key_coverage_matches_reference_counts() {
+        let path = std::env::var_os("AFTERBURNER_ANIMA_PATH")
+            .expect("AFTERBURNER_ANIMA_PATH must point to anima_baseV10.safetensors");
+        let coverage = inspect_anima_weight_coverage(path).unwrap();
+        // Key classification recognizes every tensor in the reference
+        // checkpoint, including the per-block q_norm/k_norm parameters.
+        assert_eq!(coverage.mapped_count(), 685);
+        assert_eq!(coverage.unmapped_count(), 0);
+        assert!(
+            coverage
+                .mapped
+                .iter()
+                .any(|(key, _)| key.ends_with("blocks.0.self_attn.q_proj.weight"))
+        );
+        assert!(
+            coverage
+                .mapped
+                .iter()
+                .any(|(key, _)| key.contains("llm_adapter.out_proj.weight"))
+        );
+        let norm_count = coverage
+            .mapped
+            .iter()
+            .filter(|(_, slot)| {
+                matches!(
+                    slot,
+                    AnimaWeightSlot::Block { component, .. }
+                        | AnimaWeightSlot::LlmAdapter { component, .. }
+                        if component.ends_with("_norm")
+                )
+            })
+            .count();
+        assert_eq!(norm_count, 136);
+    }
+
+    #[test]
+    #[ignore = "reads a reference Kohya_ss LoRA; set AFTERBURNER_REFERENCE_LORA_PATH to run"]
+    fn kohya_reference_lora_plan_matches_anima_rank_eight_counts() {
+        let path = std::env::var_os("AFTERBURNER_REFERENCE_LORA_PATH")
+            .expect("AFTERBURNER_REFERENCE_LORA_PATH must point to a Kohya_ss LoRA");
+        let plan = inspect_anima_lora_file(path, &LoraConfig::default()).unwrap();
+        assert_eq!(plan.target_count(), 280);
+        assert_eq!(plan.parameter_count(), 11_468_800);
+        assert!(plan.targets.iter().all(|target| target.rank == 8));
     }
 }

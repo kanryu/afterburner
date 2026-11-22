@@ -15,6 +15,21 @@ pub struct Gradients {
 }
 
 impl Gradients {
+    pub(crate) fn from_root<B: Backend>(root_node: NodeId, root_tensor: FloatTensor<B>) -> Self {
+        let mut gradients = Self {
+            container: TensorContainer::new(),
+        };
+        gradients.register::<B>(
+            root_node,
+            B::float_ones(
+                root_tensor.shape(),
+                &B::float_device(&root_tensor),
+                root_tensor.dtype().into(),
+            ),
+        );
+        gradients
+    }
+
     /// Creates a new gradients container.
     pub fn new<B: Backend>(root_node: NodeRef, root_tensor: FloatTensor<B>) -> Self {
         let mut gradients = Self {

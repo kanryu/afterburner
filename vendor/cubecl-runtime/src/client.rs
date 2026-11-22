@@ -495,10 +495,10 @@ where
     ///
     /// - Using that memory strategy is beneficial for stating model parameters and similar workflows.
     /// - You can call [Self::memory_cleanup()] if you want to free persistent memory.
-    pub fn memory_persistent_allocation<Input, Output, Func: Fn(Input) -> Output>(
+    pub fn memory_persistent_allocation<Input, Output, Func: FnMut(Input) -> Output>(
         &self,
         input: Input,
-        func: Func,
+        mut func: Func,
     ) -> Output {
         let device_guard = self.context.lock_device();
 

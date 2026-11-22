@@ -1,5 +1,5 @@
 use alloc::{boxed::Box, vec, vec::Vec};
-use core::marker::PhantomData;
+use core::{marker::PhantomData, sync::atomic::{AtomicUsize, Ordering}};
 
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports, reason = "required on aarch64, unused on x86_64")]
@@ -26,6 +26,109 @@ use burn_tensor::{
 };
 
 use super::maxmin::MaxMinDim;
+
+const MATMUL_BACKWARD_SEQUENCE_THRESHOLD: usize = 1024;
+const MATMUL_BACKWARD_CHUNK_SIZE: usize = 512;
+static MATMUL_BACKWARD_CHUNK: AtomicUsize = AtomicUsize::new(MATMUL_BACKWARD_CHUNK_SIZE);
+
+/// Sets the sequence tile used by large Matmul backward operations.
+pub fn set_matmul_backward_chunk_size(size: usize) {
+    MATMUL_BACKWARD_CHUNK.store(size.max(1), Ordering::Relaxed);
+}
+
+fn matmul_backward_chunk_size() -> usize {
+    let configured = MATMUL_BACKWARD_CHUNK.load(Ordering::Relaxed);
+    if configured != MATMUL_BACKWARD_CHUNK_SIZE {
+        return configured;
+    }
+    std::env::var("AFTERBURNER_MATMUL_BACKWARD_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(MATMUL_BACKWARD_CHUNK_SIZE)
+}
+
+fn slice_sequence<B: Backend>(
+    tensor: B::FloatTensorPrimitive,
+    batch: usize,
+    start: usize,
+    end: usize,
+) -> B::FloatTensorPrimitive {
+    let shape = tensor.shape();
+    B::float_slice(
+        tensor,
+        &[
+            burn_tensor::Slice::new(0, Some(batch as isize), 1),
+            burn_tensor::Slice::new(start as isize, Some(end as isize), 1),
+            burn_tensor::Slice::new(0, Some(shape[2] as isize), 1),
+        ],
+    )
+}
+
+fn matmul_input_backward<B: Backend>(
+    grad: B::FloatTensorPrimitive,
+    rhs: B::FloatTensorPrimitive,
+    lhs_shape: &Shape,
+) -> B::FloatTensorPrimitive {
+    let rhs_shape = rhs.shape();
+    // Output projections with a narrow output dimension do not create a
+    // problematic workspace. Keeping them as one GEMM avoids turning a cheap
+    // projection into many serialized CUDA launches.
+    if lhs_shape.num_dims() != 3
+        || lhs_shape[1] <= MATMUL_BACKWARD_SEQUENCE_THRESHOLD
+        || rhs_shape.num_dims() != 2
+        || rhs_shape[0] <= 256
+    {
+        return B::float_matmul(grad, B::float_transpose(rhs));
+    }
+
+    let batch = lhs_shape[0];
+    let sequence = lhs_shape[1];
+    let chunk = matmul_backward_chunk_size();
+    let rhs = B::float_transpose(rhs);
+    let mut pieces = Vec::new();
+    for start in (0..sequence).step_by(chunk) {
+        let end = (start + chunk).min(sequence);
+        pieces.push(B::float_matmul(
+            slice_sequence::<B>(grad.clone(), batch, start, end),
+            rhs.clone(),
+        ));
+    }
+    B::float_cat(pieces, 1)
+}
+
+fn matmul_rhs_backward<B: Backend>(
+    lhs: B::FloatTensorPrimitive,
+    grad: B::FloatTensorPrimitive,
+    rhs_shape: &Shape,
+) -> B::FloatTensorPrimitive {
+    let lhs_shape = lhs.shape();
+    if lhs_shape.num_dims() != 3
+        || lhs_shape[1] <= MATMUL_BACKWARD_SEQUENCE_THRESHOLD
+        || rhs_shape.num_dims() != 2
+        || rhs_shape[1] <= 256
+    {
+        return B::float_matmul(B::float_transpose(lhs), grad);
+    }
+
+    let batch = lhs_shape[0];
+    let sequence = lhs_shape[1];
+    let chunk = matmul_backward_chunk_size();
+    let mut accumulated = None;
+    for start in (0..sequence).step_by(chunk) {
+        let end = (start + chunk).min(sequence);
+        let partial = B::float_matmul(
+            B::float_transpose(slice_sequence::<B>(lhs.clone(), batch, start, end)),
+            slice_sequence::<B>(grad.clone(), batch, start, end),
+        );
+        accumulated = Some(match accumulated {
+            Some(value) => B::float_add(value, partial),
+            None => partial,
+        });
+    }
+    debug_assert_eq!(rhs_shape.num_dims(), 2);
+    accumulated.expect("matmul sequence gradient produced no chunks")
+}
 
 // Unsqueeze op on primitive.
 fn unsqueeze_like<B: Backend>(
@@ -564,20 +667,45 @@ impl<B: Backend, C: CheckpointStrategy> FloatTensorOps<Self> for Autodiff<B, C> 
                 let (lhs, rhs, broadcast) = ops.state;
                 let lhs = lhs.map(|lhs| checkpointer.retrieve_node_output(lhs));
                 let rhs = rhs.map(|rhs| checkpointer.retrieve_node_output(rhs));
+                let lhs_shape = lhs
+                    .as_ref()
+                    .map(|tensor: &B::FloatTensorPrimitive| tensor.shape());
+                let rhs_shape = rhs
+                    .as_ref()
+                    .map(|tensor: &B::FloatTensorPrimitive| tensor.shape());
 
                 binary::<B, _, _>(
                     ops.parents,
                     ops.node,
                     grads,
                     |grad| {
-                        let rhs = B::float_transpose(rhs.unwrap());
-                        let grad = B::float_matmul(grad, rhs);
+                        let rhs = rhs.unwrap();
+                        // Linear layers operate on [batch, sequence, hidden].
+                        // Split the sequence dimension for the input gradient
+                        // so CUDA does not need to materialize one large
+                        // backward matmul workspace for the entire image.
+                        let grad = lhs_shape
+                            .as_ref()
+                            .map(|shape| matmul_input_backward::<B>(grad.clone(), rhs.clone(), shape))
+                            .unwrap_or_else(|| B::float_matmul(grad, B::float_transpose(rhs)));
 
                         broadcast.backward_lhs::<B>(grad)
                     },
                     |grad| {
-                        let lhs = B::float_transpose(lhs.unwrap());
-                        let grad = B::float_matmul(lhs, grad);
+                        let lhs = lhs.unwrap();
+                        // When the lhs is an untracked leaf, the checkpoint
+                        // planner does not retain the rhs shape.  The shape
+                        // is nevertheless fully determined by lhs and the
+                        // output gradient for the rank-2/3 linear cases.
+                        let rhs_shape = rhs_shape.clone().unwrap_or_else(|| {
+                            let lhs_shape = lhs.shape();
+                            let grad_shape = grad.shape();
+                            Shape::new([
+                                lhs_shape[lhs_shape.num_dims() - 1],
+                                grad_shape[grad_shape.num_dims() - 1],
+                            ])
+                        });
+                        let grad = matmul_rhs_backward::<B>(lhs, grad, &rhs_shape);
 
                         broadcast.backward_rhs::<B>(grad)
                     },
@@ -2890,7 +3018,41 @@ impl<B: Backend, C: CheckpointStrategy> FloatTensorOps<Self> for Autodiff<B, C> 
     }
 
     fn float_cast(tensor: FloatTensor<Self>, dtype: burn_tensor::FloatDType) -> FloatTensor<Self> {
-        AutodiffTensor::new(B::float_cast(tensor.primitive, dtype))
+        #[derive(Debug)]
+        struct Cast;
+
+        impl<B: Backend> Backward<B, 1> for Cast {
+            type State = FloatDType;
+
+            fn backward(
+                self,
+                ops: Ops<Self::State, 1>,
+                grads: &mut Gradients,
+                _checkpointer: &mut Checkpointer,
+            ) {
+                // A dtype cast is value-preserving.  Convert the incoming
+                // gradient back to the source dtype instead of detaching the
+                // graph, which was the previous implementation's behavior.
+                unary::<B, _>(ops.parents, ops.node, grads, |grad| {
+                    B::float_cast(grad, ops.state)
+                });
+            }
+        }
+
+        match Cast
+            .prepare::<C>([tensor.node.clone()])
+            .compute_bound()
+            .parents([&tensor])
+            .stateful()
+        {
+            OpsKind::Tracked(prep) => prep.finish(
+                tensor.primitive.dtype().into(),
+                B::float_cast(tensor.primitive, dtype),
+            ),
+            OpsKind::UnTracked(prep) => {
+                prep.finish(B::float_cast(tensor.primitive, dtype))
+            }
+        }
     }
 
     // TODO: Implement float_prod and float_sum

@@ -125,11 +125,26 @@ impl AutodiffServer {
         mut grads: Gradients,
         mut checkpointer: Checkpointer,
     ) -> Gradients {
+        let debug_steps = std::env::var_os("AFTERBURNER_DEBUG_AUTODIFF_STEPS").is_some();
+        let mut reverse_depth = 0usize;
+        let mut executed = 0usize;
         tape.into_iter().rev().for_each(|steps| {
-            steps
-                .into_iter()
-                .for_each(|step| step.step(&mut grads, &mut checkpointer))
+            if debug_steps {
+                eprintln!(
+                    "[autodiff] reverse_depth={} operations={}",
+                    reverse_depth,
+                    steps.len()
+                );
+            }
+            reverse_depth += 1;
+            steps.into_iter().for_each(|step| {
+                step.step(&mut grads, &mut checkpointer);
+                executed += 1;
+            });
         });
+        if debug_steps {
+            eprintln!("[autodiff] backward_complete operations={executed}");
+        }
 
         // All backward steps have completed. Drop any checkpoint that was
         // conservatively retained by the n_required accounting before the

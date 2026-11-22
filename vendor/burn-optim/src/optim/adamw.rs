@@ -1,7 +1,7 @@
 use burn_core as burn;
 
 use burn::config::Config;
-use burn::tensor::{Tensor, backend::AutodiffBackend};
+use burn::tensor::{DType, Tensor, backend::AutodiffBackend};
 use burn::tensor::{backend::Backend, ops::Device};
 use burn::{module::AutodiffModule, record::Record};
 
@@ -57,6 +57,11 @@ pub struct AdamW {
 pub struct AdamWState<B: Backend, const D: usize> {
     /// Th current adaptive momentum state.
     pub momentum: AdaptiveMomentumState<B, D>,
+    /// FP32 master copy of the parameter. The model may store BF16 weights
+    /// for the forward pass, but optimizer updates must not accumulate on the
+    /// quantized parameter value (PyTorch keeps trainable parameters in a
+    /// higher precision representation in this configuration).
+    pub master: Tensor<B, D>,
 }
 
 impl<B: Backend> SimpleOptimizer<B> for AdamW {
@@ -74,36 +79,43 @@ impl<B: Backend> SimpleOptimizer<B> for AdamW {
         // State of the optimizer.
         state: Option<Self::State<D>>,
     ) -> (Tensor<B, D>, Option<Self::State<D>>) {
-        let (raw_delta, momentum_state) = self.momentum.transform(grad, state.map(|s| s.momentum));
+        let tensor_dtype = tensor.dtype();
+        let (master, previous_momentum) = match state {
+            Some(state) => (state.master, Some(state.momentum)),
+            None => (tensor.cast(DType::F32), None),
+        };
+        let (raw_delta, momentum_state) = self.momentum.transform(grad, previous_momentum);
 
         let decay_rate = lr * (self.weight_decay as f64);
 
         let decayed_tensor = if decay_rate == 0.0 {
-            tensor.clone()
+            master.clone()
         } else if self.cautious_weight_decay {
             // Cautious weight decay.
             // See: https://arxiv.org/abs/2510.12402
-            let tensor_pos = tensor.clone().greater_equal_elem(0.0);
+            let tensor_pos = master.clone().greater_equal_elem(0.0);
             let grad_pos = momentum_state.moment_1.clone().greater_equal_elem(0.0);
             let differ = tensor_pos.not_equal(grad_pos);
 
             // Zero out the decay where the decay is counter to the update direction.
-            tensor.clone() - tensor.mul_scalar(decay_rate).mask_fill(differ, 0.0)
+            master.clone() - master.mul_scalar(decay_rate).mask_fill(differ, 0.0)
         } else {
-            tensor.clone().mul_scalar(1.0 - decay_rate)
+            master.clone().mul_scalar(1.0 - decay_rate)
         };
 
         let tensor_updated = decayed_tensor - raw_delta.mul_scalar(lr);
 
         let state = AdamWState {
             momentum: momentum_state,
+            master: tensor_updated.clone(),
         };
 
-        (tensor_updated, Some(state))
+        (tensor_updated.cast(tensor_dtype), Some(state))
     }
 
     fn to_device<const D: usize>(mut state: Self::State<D>, device: &Device<B>) -> Self::State<D> {
         state.momentum = state.momentum.to_device(device);
+        state.master = state.master.to_device(device);
         state
     }
 }
@@ -146,26 +158,30 @@ impl AdaptiveMomentumW {
         grad: Tensor<B, D>,
         state: Option<AdaptiveMomentumState<B, D>>,
     ) -> (Tensor<B, D>, AdaptiveMomentumState<B, D>) {
+        // Keep AdamW moments and all reductions in FP32. The parameter and
+        // returned update may remain BF16, but storing m/v in the parameter
+        // dtype changes AdamW's trajectory and does not match PyTorch or
+        // bitsandbytes, which maintain higher-precision optimizer math.
+        let grad = grad.cast(DType::F32);
         let factor_1 = 1.0 - self.beta_1;
         let factor_2 = 1.0 - self.beta_2;
 
-        let state = if let Some(mut state) = state {
+        let (moment_1, moment_2, time) = if let Some(state) = state {
             // Update first moment estimate.
-            state.moment_1 = state
+            let moment_1 = state
                 .moment_1
+                .cast(DType::F32)
                 .mul_scalar(self.beta_1)
                 .add(grad.clone().mul_scalar(factor_1));
 
             // Update second moment estimate.
-            state.moment_2 = state
+            let moment_2 = state
                 .moment_2
+                .cast(DType::F32)
                 .mul_scalar(self.beta_2)
                 .add(grad.powi_scalar(2).mul_scalar(factor_2));
 
-            // Update time.
-            state.time += 1;
-
-            state
+            (moment_1, moment_2, state.time + 1)
         } else {
             // Initialize first moment estimate.
             let moment_1 = grad.clone().mul_scalar(factor_1);
@@ -173,29 +189,36 @@ impl AdaptiveMomentumW {
             // Initialize second moment estimate.
             let moment_2 = grad.powi_scalar(2).mul_scalar(factor_2);
 
-            AdaptiveMomentumState::new(1, moment_1, moment_2)
+            (moment_1, moment_2, 1)
         };
 
-        let time: i32 = state.time as i32;
+        let time_i32: i32 = time as i32;
 
         // Compute bias-corrected first and second moment estimates.
-        let moment_1_corrected = state
-            .moment_1
+        let moment_1_corrected = moment_1
             .clone()
-            .div_scalar(1f32 - self.beta_1.powi(time));
+            .div_scalar(1f32 - self.beta_1.powi(time_i32));
 
-        let moment_2_corrected = state
-            .moment_2
+        let moment_2_corrected = moment_2
             .clone()
-            .div_scalar(1f32 - self.beta_2.powi(time));
+            .div_scalar(1f32 - self.beta_2.powi(time_i32));
 
         // Compute update delta. This still needs to be scaled by the learning rate.
-        let update_delta =
-            moment_1_corrected.div(moment_2_corrected.sqrt().add_scalar(self.epsilon));
+        let update_delta = moment_1_corrected
+            .div(moment_2_corrected.sqrt().add_scalar(self.epsilon))
+            .cast(DType::F32);
 
         (
             update_delta,
-            AdaptiveMomentumState::new(state.time, state.moment_1, state.moment_2),
+            AdaptiveMomentumState::new(
+                time,
+                // Keep optimizer state in FP32. Burn's CUDA Q8S
+                // quantize/dequantize path produced non-finite moment values
+                // for Anima's mixed-size LoRA factors, which then corrupted
+                // the exported adapter even when the loss was finite.
+                moment_1,
+                moment_2,
+            ),
         )
     }
 }

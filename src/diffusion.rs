@@ -30,7 +30,23 @@ pub enum LossWeighting {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TimestepSampling {
     Uniform,
-    Sigmoid { mean: f32, std: f32 },
+    /// Kohya's discrete `sigma` sampler: draw a logit-normal quantile,
+    /// select the corresponding descending scheduler entry, then apply the
+    /// flow shift. This is intentionally distinct from the continuous
+    /// sigmoid sampler because the scheduler reverses the timestep axis.
+    Sigma {
+        mean: f32,
+        std: f32,
+    },
+    Sigmoid {
+        mean: f32,
+        std: f32,
+    },
+    /// Logit-normal sigma sampling used by kohya_ss Anima training.
+    LogitNormal {
+        mean: f32,
+        std: f32,
+    },
 }
 
 /// Errors raised while creating a diffusion training example.
@@ -203,8 +219,8 @@ impl DiffusionSchedule {
         Ok(((value * self.steps() as f32).floor() as usize).min(self.steps() - 1))
     }
 
-    /// Samples a continuous sigma in `[0, 1]`. Sigmoid sampling intentionally
-    /// does not apply `discrete_flow_shift`, matching kohya_ss.
+    /// Samples a continuous sigma in `[0, 1]`. Flow-matching schedules apply
+    /// their shift after sampling, matching kohya_ss's sigma path.
     pub fn sample_sigma(
         &self,
         first_uniform: f32,
@@ -215,6 +231,20 @@ impl DiffusionSchedule {
         let second = second_uniform.clamp(f32::MIN_POSITIVE, 1.0 - f32::EPSILON);
         let value = match sampling {
             TimestepSampling::Uniform => first,
+            TimestepSampling::Sigma { mean, std } => {
+                if !mean.is_finite() || !std.is_finite() || std <= 0.0 {
+                    return Err(DiffusionError::InvalidSchedule(
+                        "sigma timestep mean must be finite and std must be positive".into(),
+                    ));
+                }
+                let radius = (-2.0 * first.ln()).sqrt();
+                let normal = radius * (2.0 * std::f32::consts::PI * second).cos();
+                // sd3_train_utils builds timesteps in descending order and
+                // indexes them with floor(u * 1000). The equivalent
+                // continuous value is therefore 1 - sigmoid(normal).
+                let quantile = 1.0 / (1.0 + (-(mean + std * normal)).exp());
+                1.0 - quantile
+            }
             TimestepSampling::Sigmoid { mean, std } => {
                 if !mean.is_finite() || !std.is_finite() || std <= 0.0 {
                     return Err(DiffusionError::InvalidSchedule(
@@ -223,8 +253,25 @@ impl DiffusionSchedule {
                 }
                 let radius = (-2.0 * first.ln()).sqrt();
                 let normal = radius * (2.0 * std::f32::consts::PI * second).cos();
-                1.0 / (1.0 + -(mean + std * normal).exp())
+                // Logistic sigmoid: 1 / (1 + exp(-x)). Keep the negation
+                // inside exp; `1 + -exp(x)` collapses most samples to the
+                // lower clamp boundary and silently trains at sigma=0.
+                1.0 / (1.0 + (-(mean + std * normal)).exp())
             }
+            TimestepSampling::LogitNormal { mean, std } => {
+                if !mean.is_finite() || !std.is_finite() || std <= 0.0 {
+                    return Err(DiffusionError::InvalidSchedule(
+                        "logit-normal timestep mean must be finite and std must be positive".into(),
+                    ));
+                }
+                let radius = (-2.0 * first.ln()).sqrt();
+                let normal = radius * (2.0 * std::f32::consts::PI * second).cos();
+                1.0 / (1.0 + (-(mean + std * normal)).exp())
+            }
+        };
+        let value = match self.kind {
+            ScheduleKind::FlowMatching { shift } => shift * value / (1.0 + (shift - 1.0) * value),
+            ScheduleKind::Ddpm => value,
         };
         Ok(value.clamp(0.0, 1.0))
     }
@@ -367,7 +414,12 @@ impl TrainingExample {
                 .as_ref()
                 .map(|value| value.attention_mask.clone()),
             target,
-            timestep_features: timestep_embedding_value(sigma, 2048),
+            // kohya_ss samples `timesteps = sigmas * num_train_timesteps`,
+            // casts that tensor to the mixed-precision input dtype, and only
+            // then builds the sinusoidal embedding. Reproduce that rounding
+            // before creating the feature vector instead of embedding the
+            // unrounded continuous sigma directly.
+            timestep_features: timestep_embedding_from_sampled_sigma(sigma, steps, 2048),
             target_kind: TrainingTarget::FlowMatching,
             sigma: Some(sigma),
         })
@@ -381,11 +433,21 @@ pub fn timestep_embedding(timestep: usize, steps: usize, dimension: usize) -> Va
 
 fn timestep_embedding_value(normalized: f32, dimension: usize) -> VaeTensor {
     let mut values = Vec::with_capacity(dimension);
-    for index in 0..dimension / 2 {
-        let frequency = (-std::f32::consts::LN_10 * 4.0 * index as f32 / dimension as f32).exp();
+    let half_dimension = dimension / 2;
+    for index in 0..half_dimension {
+        // Match kohya_ss Anima's TimestepEmbedder exactly:
+        // exponent = -log(10000) * arange(half_dim) / half_dim,
+        // followed by concat(cos(embedding), sin(embedding)).
+        let frequency =
+            (-std::f32::consts::LN_10 * 4.0 * index as f32 / half_dimension as f32).exp();
+        let angle = normalized * frequency;
+        values.push(angle.cos());
+    }
+    for index in 0..half_dimension {
+        let frequency =
+            (-std::f32::consts::LN_10 * 4.0 * index as f32 / half_dimension as f32).exp();
         let angle = normalized * frequency;
         values.push(angle.sin());
-        values.push(angle.cos());
     }
     if dimension % 2 != 0 {
         values.push(0.0);
@@ -394,6 +456,18 @@ fn timestep_embedding_value(normalized: f32, dimension: usize) -> VaeTensor {
         shape: vec![1, dimension],
         data: values,
     }
+}
+
+/// Builds Anima timestep features from kohya_ss's continuous sigma sampler.
+///
+/// The Python trainer first forms `sigma * steps`, stores it in the selected
+/// mixed-precision dtype (FP16 for the reference run), divides by `steps` in
+/// the timestep embedder, and computes the sinusoidal features from that
+/// rounded value. The explicit FP16 round here keeps the feature input on the
+/// same side of the quantization boundary as the reference implementation.
+fn timestep_embedding_from_sampled_sigma(sigma: f32, steps: usize, dimension: usize) -> VaeTensor {
+    let sampled_timestep = half::f16::from_f32(sigma * steps as f32).to_f32();
+    timestep_embedding_value(sampled_timestep / steps.max(1) as f32, dimension)
 }
 
 #[cfg(test)]
@@ -429,6 +503,77 @@ mod tests {
         assert_eq!(example.target_kind, TrainingTarget::Epsilon);
         assert_eq!(example.text_embedding.data, vec![0.1, 0.2]);
         assert_eq!(example.timestep_features.shape, vec![1, 2048]);
+    }
+
+    #[test]
+    fn timestep_features_match_anima_cosine_then_sine_layout() {
+        let features = timestep_embedding_value(0.25, 4);
+        let expected = vec![
+            0.25_f32.cos(),
+            (0.25_f32 * 0.01).cos(),
+            0.25_f32.sin(),
+            (0.25_f32 * 0.01).sin(),
+        ];
+        for (actual, expected) in features.data.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn flow_cache_uses_normalized_timestep_features() {
+        let sample = CachedTrainingSample::new(
+            "image-01",
+            0,
+            tensor(vec![0.1, 0.2]),
+            tensor(vec![1.0, 2.0]),
+        );
+        let example =
+            TrainingExample::from_cache_with_sigma(&sample, 0.5, 1000, tensor(vec![0.3, -0.4]))
+                .unwrap();
+        let rounded_timestep = half::f16::from_f32(0.5 * 1000.0).to_f32() / 1000.0;
+        let expected = timestep_embedding_value(rounded_timestep, 2048);
+        assert_eq!(example.timestep, 500);
+        assert_eq!(example.timestep_features.data, expected.data);
+    }
+
+    #[test]
+    fn flow_cache_matches_kohya_probe_step_three_reference_values() {
+        // First four values copied from the existing Kohya probe dump at
+        // outputs/afterburner-probe/step-000003. The probe tensors are BF16,
+        // so a small tolerance is intentional when comparing reconstructed
+        // FP32 arithmetic.
+        let sample = CachedTrainingSample::new(
+            "kohya-step3",
+            0,
+            tensor(vec![0.0, 0.0, 0.0, 0.0]),
+            tensor(vec![
+                0.320068359375,
+                0.433349609375,
+                0.401123046875,
+                0.44970703125,
+            ]),
+        );
+        let sigma = 0.40445560216903687_f32;
+        let noise = tensor(vec![-0.57763671875, 1.1416015625, 0.642578125, 0.369140625]);
+        let example = TrainingExample::from_cache_with_sigma(&sample, sigma, 1000, noise).unwrap();
+        let expected_noisy = vec![
+            -0.042999267578125_f32,
+            0.7197265625,
+            0.498779296875,
+            0.417236328125,
+        ];
+        let expected_target = vec![
+            -0.8974609375_f32,
+            0.7080078125,
+            0.241455078125,
+            -0.08056640625,
+        ];
+        for (actual, expected) in example.noisy_latent.data.iter().zip(expected_noisy) {
+            assert!((actual - expected).abs() < 2e-3);
+        }
+        for (actual, expected) in example.target.data.iter().zip(expected_target) {
+            assert!((actual - expected).abs() < 2e-3);
+        }
     }
 
     #[test]
@@ -506,5 +651,40 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn sigmoid_timestep_sampling_uses_logistic_sign_correctly() {
+        let schedule = DiffusionSchedule::flow_matching(1000, 1.0).unwrap();
+        let sigma = schedule
+            .sample_sigma(
+                0.5682303265,
+                0.2254634289,
+                TimestepSampling::Sigmoid {
+                    mean: 0.0,
+                    std: 1.0,
+                },
+            )
+            .unwrap();
+        assert!((sigma - 0.5407264).abs() < 1e-5, "sigma={sigma}");
+    }
+
+    #[test]
+    fn sigma_sampling_matches_descending_kohya_scheduler_axis() {
+        let schedule = DiffusionSchedule::flow_matching(1000, 3.0).unwrap();
+        let sigma = schedule
+            .sample_sigma(
+                0.5,
+                0.5,
+                TimestepSampling::Sigma {
+                    mean: 0.0,
+                    std: 1.0,
+                },
+            )
+            .unwrap();
+        // Box-Muller at (0.5, 0.5) produces a non-zero normal variate because
+        // cos(2*pi*0.5) = -1. The descending scheduler and shift=3 mapping
+        // therefore produce the following deterministic reference value.
+        assert!((sigma - 0.9068716).abs() < 1e-6, "sigma={sigma}");
     }
 }

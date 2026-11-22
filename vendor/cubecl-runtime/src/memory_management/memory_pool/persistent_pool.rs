@@ -89,18 +89,23 @@ impl MemoryPool for PersistentPool {
         let padding = calculate_padding(size, self.alignment);
         let size_alloc = size + padding;
 
+        // CUDA storage allocations must use the aligned size.  The storage
+        // handle already includes that alignment, so padding must not be
+        // added a second time by Slice::effective_size().
         let storage_handle = storage.alloc(size_alloc)?;
         let slice_handle = SliceHandle::new();
-        let slice = Slice::new(storage_handle, slice_handle.clone(), padding);
+        let slice = Slice::new(storage_handle, slice_handle.clone(), 0);
 
         let slice_id = slice.id();
 
-        match self.sizes.get_mut(&size) {
+        // Index slices by the effective aligned size, exactly as try_reserve
+        // and cleanup do.
+        match self.sizes.get_mut(&size_alloc) {
             Some(vals) => {
                 vals.push(slice_id);
             }
             None => {
-                self.sizes.insert(size, vec![slice_id]);
+                self.sizes.insert(size_alloc, vec![slice_id]);
             }
         }
 
@@ -195,5 +200,22 @@ mod tests {
         let usage = pool.get_memory_usage();
         assert_eq!(usage.bytes_in_use, 0);
         assert_eq!(usage.bytes_reserved, 2048);
+    }
+
+    #[test]
+    fn persistent_pool_cleans_aligned_allocations() {
+        let mut storage = BytesStorage::default();
+        let mut pool = PersistentPool::new(1024 * 1024, 32);
+
+        let allocation = pool.alloc(&mut storage, 33).unwrap();
+        assert_eq!(pool.get_memory_usage().bytes_reserved, 64);
+        drop(allocation);
+
+        // The requested size (33) and effective aligned size (64) differ.
+        // Cleanup must remove the slice without a bucket-key mismatch.
+        pool.cleanup(&mut storage, 0, true);
+        let usage = pool.get_memory_usage();
+        assert_eq!(usage.bytes_in_use, 0);
+        assert_eq!(usage.bytes_reserved, 0);
     }
 }

@@ -5,16 +5,90 @@
 //! that contributes, so the first migration step can execute it as a 2D
 //! convolution while preserving the checkpoint layout.
 
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{Conv2d, Conv2dConfig, VarBuilder, ops::softmax_last_dim};
 
 use crate::{
-    QwenImageVaeConfig,
     preprocess::PreprocessError,
-    vae::{QwenImageVaeEncoder, VaeError, VaeTensor, normalize_qwen_image_latent},
+    vae::{QwenImageVaeEncoder, VaeError, VaeTensor},
 };
+
+static VAE_STAGE_TRACE_USED: AtomicBool = AtomicBool::new(false);
+
+fn trace_vae_stage(name: &str, tensor: &Tensor) {
+    if std::env::var_os("AFTERBURNER_VAE_STAGE_TRACE").is_none() {
+        return;
+    }
+    let tensor = match tensor.to_dtype(DType::F32) {
+        Ok(tensor) => tensor,
+        Err(error) => {
+            eprintln!("[vae-stage] {name} dtype conversion failed: {error}");
+            return;
+        }
+    };
+    let values = match tensor
+        .flatten_all()
+        .and_then(|tensor| tensor.to_vec1::<f32>())
+    {
+        Ok(values) => values,
+        Err(error) => {
+            eprintln!("[vae-stage] {name} readback failed: {error}");
+            return;
+        }
+    };
+    if let Some(directory) = std::env::var_os("AFTERBURNER_VAE_STAGE_DUMP_DIR") {
+        let directory = std::path::PathBuf::from(directory);
+        if let Err(error) = std::fs::create_dir_all(&directory) {
+            eprintln!("[vae-stage] dump directory creation failed: {error}");
+        } else {
+            let data_path = directory.join(format!("{name}.f32le"));
+            let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<f32>());
+            for value in &values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            if let Err(error) = std::fs::write(&data_path, bytes) {
+                eprintln!("[vae-stage] dump write failed for {name}: {error}");
+            }
+            let shape = tensor
+                .dims()
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            if let Err(error) = std::fs::write(directory.join(format!("{name}.shape")), shape) {
+                eprintln!("[vae-stage] shape dump failed for {name}: {error}");
+            }
+        }
+    }
+    if values.is_empty() {
+        eprintln!("[vae-stage] {name} shape={:?} empty", tensor.dims());
+        return;
+    }
+    let minimum = values.iter().copied().fold(f32::INFINITY, f32::min);
+    let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mean = values.iter().sum::<f32>() / values.len() as f32;
+    let l2 = values.iter().map(|value| value * value).sum::<f32>().sqrt();
+    eprintln!(
+        "[vae-stage] {name} shape={:?} min={minimum:.8e} max={maximum:.8e} mean={mean:.8e} l2={l2:.8e}",
+        tensor.dims()
+    );
+    if name == "input" && tensor.dims().len() == 4 && tensor.dims()[1] <= 4 {
+        let channels = tensor.dims()[1];
+        let plane = tensor.dims()[2] * tensor.dims()[3];
+        let means = (0..channels)
+            .map(|channel| {
+                let start = channel * plane;
+                values[start..start + plane].iter().sum::<f32>() / plane as f32
+            })
+            .collect::<Vec<_>>();
+        eprintln!("[vae-stage] input_channel_means={means:?}");
+    }
+}
 
 #[derive(Clone, Debug)]
 struct CausalConv2d {
@@ -49,6 +123,10 @@ impl QwenRmsNorm2d {
     }
 
     fn forward(&self, input: &Tensor) -> Result<Tensor, String> {
+        // Match kohya_ss's QwenImageRMS_norm exactly: PyTorch receives the
+        // VAE activation in fp16 and keeps this normalize/scale/multiply
+        // chain in fp16. Promoting the reduction to f32 changes the rounded
+        // activation before every following residual block.
         let norm = input
             .sqr()
             .map_err(|error| error.to_string())?
@@ -123,23 +201,37 @@ impl CandleQwenImageResidualBlock2d {
     }
 
     pub fn forward(&self, input: &Tensor) -> Result<Tensor, String> {
+        self.forward_traced(input, None)
+    }
+
+    fn forward_traced(&self, input: &Tensor, trace_prefix: Option<&str>) -> Result<Tensor, String> {
         let shortcut = match &self.shortcut {
             Some(layer) => layer.forward(input)?,
             None => input.clone(),
         };
-        let hidden = self
-            .norm1
-            .forward(input)?
-            .silu()
-            .map_err(|error| error.to_string())?;
+        let hidden = self.norm1.forward(input)?;
+        if let Some(prefix) = trace_prefix {
+            trace_vae_stage(&format!("{prefix}_norm1"), &hidden);
+        }
+        let hidden = hidden.silu().map_err(|error| error.to_string())?;
         let hidden = self.conv1.forward(&hidden)?;
-        let hidden = self
-            .norm2
-            .forward(&hidden)?
-            .silu()
-            .map_err(|error| error.to_string())?;
+        if let Some(prefix) = trace_prefix {
+            trace_vae_stage(&format!("{prefix}_conv1"), &hidden);
+        }
+        let hidden = self.norm2.forward(&hidden)?;
+        if let Some(prefix) = trace_prefix {
+            trace_vae_stage(&format!("{prefix}_norm2"), &hidden);
+        }
+        let hidden = hidden.silu().map_err(|error| error.to_string())?;
         let hidden = self.conv2.forward(&hidden)?;
-        hidden.add(&shortcut).map_err(|error| error.to_string())
+        if let Some(prefix) = trace_prefix {
+            trace_vae_stage(&format!("{prefix}_conv2"), &hidden);
+        }
+        let output = hidden.add(&shortcut).map_err(|error| error.to_string())?;
+        if let Some(prefix) = trace_prefix {
+            trace_vae_stage(prefix, &output);
+        }
+        Ok(output)
     }
 }
 
@@ -170,6 +262,12 @@ impl CausalConv2d {
             .narrow(2, temporal_kernel.saturating_sub(1), 1)
             .map_err(|error| error.to_string())?
             .squeeze(2)
+            .map_err(|error| error.to_string())?
+            // The temporal slice is a non-contiguous view. CUDA Candle's
+            // Im2Col path has a separate strided-kernel branch; materialize
+            // the ordinary contiguous [out, in, height, width] layout so its
+            // kernel interpretation matches PyTorch/cuDNN.
+            .contiguous()
             .map_err(|error| error.to_string())?;
         let bias = scope
             .get(output_channels, "bias")
@@ -225,11 +323,22 @@ impl SpatialConv2d {
     }
 
     fn forward(&self, input: &Tensor) -> Result<Tensor, String> {
+        self.forward_traced(input, None)
+    }
+
+    fn forward_traced(&self, input: &Tensor, trace_prefix: Option<&str>) -> Result<Tensor, String> {
         let input = input
             .pad_with_zeros(2, 0, 1)
             .and_then(|value| value.pad_with_zeros(3, 0, 1))
             .map_err(|error| error.to_string())?;
-        self.conv.forward(&input).map_err(|error| error.to_string())
+        if let Some(prefix) = trace_prefix {
+            trace_vae_stage(&format!("{prefix}_padded"), &input);
+        }
+        let output = self.conv.forward(&input).map_err(|error| error.to_string())?;
+        if let Some(prefix) = trace_prefix {
+            trace_vae_stage(&format!("{prefix}_conv"), &output);
+        }
+        Ok(output)
     }
 }
 
@@ -237,7 +346,7 @@ impl SpatialConv2d {
 #[derive(Clone, Debug)]
 pub struct CandleQwenImageDownsample2d {
     spatial: SpatialConv2d,
-    temporal: Option<CausalConv2d>,
+    _temporal: Option<CausalConv2d>,
 }
 
 #[derive(Clone, Debug)]
@@ -306,6 +415,9 @@ impl QwenImageAttention2d {
             .map_err(|error| error.to_string())?
             .reshape((batch, self.channels, height, width))
             .map_err(|error| error.to_string())?;
+        let attended = attended
+            .to_dtype(normalized.dtype())
+            .map_err(|error| error.to_string())?;
         let projected = self
             .proj
             .forward(&attended)
@@ -341,15 +453,19 @@ impl CandleQwenImageDownsample2d {
         } else {
             None
         };
-        Ok(Self { spatial, temporal })
+        Ok(Self {
+            spatial,
+            _temporal: temporal,
+        })
     }
 
     pub fn forward(&self, input: &Tensor) -> Result<Tensor, String> {
-        let output = self.spatial.forward(input)?;
-        match &self.temporal {
-            Some(layer) => layer.forward(&output),
-            None => Ok(output),
-        }
+        // Kohya's ordinary still-image encode path calls the VAE without a
+        // feature cache. In that path `QwenImageResample` performs only the
+        // spatial resample; its temporal convolution is used exclusively by
+        // the cached/chunked video path. Applying it here changes every
+        // latent even though the input has a singleton time axis.
+        self.spatial.forward(input)
     }
 }
 
@@ -374,6 +490,7 @@ pub struct CandleQwenImageVaeStem {
     output_conv: CausalConv2d,
     quant_conv: CausalConv2d,
     device: Device,
+    dtype: DType,
 }
 
 impl CandleQwenImageVaeStem {
@@ -393,6 +510,12 @@ impl CandleQwenImageVaeStem {
             .map_err(|error| PreprocessError::Encoder(error.to_string()))?;
         let conv_in = CausalConv2d::load(&vb, "encoder.conv1", 3, 96, 3, 3, 1)
             .map_err(PreprocessError::Encoder)?;
+        if std::env::var_os("AFTERBURNER_VAE_STAGE_DUMP_DIR").is_some() {
+            trace_vae_stage("conv_in_weight", conv_in.conv.weight());
+            if let Some(bias) = conv_in.conv.bias() {
+                trace_vae_stage("conv_in_bias", bias);
+            }
+        }
         let first_residual =
             CandleQwenImageResidualBlock2d::load(&vb, "encoder.downsamples.0", 96, 96)
                 .map_err(PreprocessError::Encoder)?;
@@ -460,6 +583,7 @@ impl CandleQwenImageVaeStem {
             output_conv,
             quant_conv,
             device: device.clone(),
+            dtype,
         })
     }
 
@@ -476,6 +600,8 @@ impl CandleQwenImageVaeStem {
         }
         let input = input
             .to_candle(&self.device)?
+            .to_dtype(self.dtype)
+            .map_err(|error| VaeError::Candle(error.to_string()))?
             .squeeze(2)
             .map_err(|error| VaeError::Candle(error.to_string()))?;
         let output = self.conv_in.forward(&input).map_err(VaeError::Candle)?;
@@ -498,6 +624,8 @@ impl CandleQwenImageVaeStem {
         }
         let input = input
             .to_candle(&self.device)?
+            .to_dtype(self.dtype)
+            .map_err(|error| VaeError::Candle(error.to_string()))?
             .squeeze(2)
             .map_err(|error| VaeError::Candle(error.to_string()))?;
         let output = self.conv_in.forward(&input).map_err(VaeError::Candle)?;
@@ -522,8 +650,13 @@ impl CandleQwenImageVaeStem {
                 actual: input.shape.clone(),
             });
         }
+        // Kohya's IMAGE_TRANSFORMS produces an fp16 tensor before the VAE
+        // convolution when preprocessing runs in fp16. Match that boundary
+        // here instead of feeding the VAE an f32 image tensor.
         let input = input
             .to_candle(&self.device)?
+            .to_dtype(self.dtype)
+            .map_err(|error| VaeError::Candle(error.to_string()))?
             .squeeze(2)
             .map_err(|error| VaeError::Candle(error.to_string()))?;
         let output = self.conv_in.forward(&input).map_err(VaeError::Candle)?;
@@ -615,67 +748,94 @@ impl CandleQwenImageVaeStem {
                 actual: input.shape.clone(),
             });
         }
+        // Kohya's IMAGE_TRANSFORMS produces an fp16 tensor before the VAE
+        // convolution when preprocessing runs in fp16. Match that boundary
+        // here instead of feeding the VAE an f32 image tensor.
         let input = input
             .to_candle(&self.device)?
+            .to_dtype(self.dtype)
+            .map_err(|error| VaeError::Candle(error.to_string()))?
             .squeeze(2)
             .map_err(|error| VaeError::Candle(error.to_string()))?;
+        let trace = std::env::var_os("AFTERBURNER_VAE_STAGE_TRACE").is_some()
+            && !VAE_STAGE_TRACE_USED.swap(true, Ordering::Relaxed);
+        if trace {
+            trace_vae_stage("input", &input);
+        }
         let mut output = self.conv_in.forward(&input).map_err(VaeError::Candle)?;
+        if trace {
+            trace_vae_stage("conv_in", &output);
+        }
         output = self
             .first_residual
-            .forward(&output)
+            .forward_traced(&output, trace.then_some("residual_0"))
             .map_err(VaeError::Candle)?;
         output = self
             .second_residual
-            .forward(&output)
+            .forward_traced(&output, trace.then_some("residual_1"))
             .map_err(VaeError::Candle)?;
         output = self
             .first_downsample
-            .forward(&output)
+            .spatial
+            .forward_traced(&output, trace.then_some("downsample_0"))
             .map_err(VaeError::Candle)?;
+
         output = self
             .second_stage_residual1
-            .forward(&output)
+            .forward_traced(&output, trace.then_some("residual_3"))
             .map_err(VaeError::Candle)?;
         output = self
             .second_stage_residual2
-            .forward(&output)
+            .forward_traced(&output, trace.then_some("residual_4"))
             .map_err(VaeError::Candle)?;
         output = self
             .second_downsample
-            .forward(&output)
+            .spatial
+            .forward_traced(&output, trace.then_some("downsample_1"))
             .map_err(VaeError::Candle)?;
         output = self
             .third_stage_residual1
-            .forward(&output)
+            .forward_traced(&output, trace.then_some("residual_6"))
             .map_err(VaeError::Candle)?;
         output = self
             .third_stage_residual2
-            .forward(&output)
+            .forward_traced(&output, trace.then_some("residual_7"))
             .map_err(VaeError::Candle)?;
         output = self
             .third_downsample
-            .forward(&output)
+            .spatial
+            .forward_traced(&output, trace.then_some("downsample_2"))
             .map_err(VaeError::Candle)?;
         output = self
             .final_residual1
-            .forward(&output)
+            .forward_traced(&output, trace.then_some("residual_9"))
             .map_err(VaeError::Candle)?;
         output = self
             .final_residual2
-            .forward(&output)
+            .forward_traced(&output, trace.then_some("residual_10"))
             .map_err(VaeError::Candle)?;
         output = self
             .middle_residual1
             .forward(&output)
             .map_err(VaeError::Candle)?;
+        if trace {
+            trace_vae_stage("middle_residual_0", &output);
+        }
         output = self
             .middle_attention
             .forward(&output)
             .map_err(VaeError::Candle)?;
+        if trace {
+            trace_vae_stage("middle_attention", &output);
+        }
         output = self
             .middle_residual2
-            .forward(&output)
+            .forward_traced(&output, Some("middle_residual_1"))
             .map_err(VaeError::Candle)?;
+        if trace {
+            trace_vae_stage("middle_residual_1", &output);
+            trace_vae_stage("middle", &output);
+        }
         output = self
             .output_norm
             .forward(&output)
@@ -687,19 +847,70 @@ impl CandleQwenImageVaeStem {
             .output_conv
             .forward(&output)
             .map_err(VaeError::Candle)?;
+        if trace {
+            trace_vae_stage("output_conv", &output);
+        }
         output = self.quant_conv.forward(&output).map_err(VaeError::Candle)?;
         output = output
             .narrow(1, 0, 16)
             .map_err(|error| VaeError::Candle(error.to_string()))?
             .unsqueeze(2)
             .map_err(|error| VaeError::Candle(error.to_string()))?;
+        if trace {
+            trace_vae_stage("quant_conv", &output);
+        }
         VaeTensor::from_candle(&output)
     }
 }
 
 impl QwenImageVaeEncoder for CandleQwenImageVaeStem {
     fn encode_qwen_input(&mut self, input: &VaeTensor) -> Result<VaeTensor, VaeError> {
-        let latent = self.forward_latent(input)?;
-        normalize_qwen_image_latent(&latent, &QwenImageVaeConfig::default())
+        // Return the raw posterior mean. The generic Qwen preprocessor owns
+        // the single latent mean/std normalization step, matching Kohya's
+        // `encode_pixels_to_latents` contract.
+        self.forward_latent(input)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qwen_rms_norm_normalizes_channels_per_pixel() {
+        let device = Device::Cpu;
+        let gamma = Tensor::ones((1, 2, 1, 1), DType::F32, &device).unwrap();
+        let norm = QwenRmsNorm2d {
+            gamma,
+            scale: (2.0_f64).sqrt(),
+        };
+        let input = Tensor::new(&[1.0_f32, 0.0, 0.0, 2.0], &device)
+            .unwrap()
+            .reshape((1, 2, 1, 2))
+            .unwrap();
+        let output = norm.forward(&input).unwrap();
+        let values = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(values.len(), 4);
+        assert!((values[0] - 2.0_f32.sqrt()).abs() < 1e-6);
+        assert!(values[1].abs() < 1e-6);
+        assert!(values[2].abs() < 1e-6);
+        assert!((values[3] - 2.0_f32.sqrt()).abs() < 1e-6);
+    }
+
+    #[test]
+    #[ignore = "loads the full Qwen Image VAE; set AFTERBURNER_QWEN_VAE_PATH to run"]
+    fn qwen_vae_safetensors_produces_anima_latent_shape() {
+        let path = std::env::var_os("AFTERBURNER_QWEN_VAE_PATH")
+            .expect("AFTERBURNER_QWEN_VAE_PATH must point to qwen_image_vae.safetensors");
+        let device = Device::Cpu;
+        let mut encoder = CandleQwenImageVaeStem::from_safetensors(path, DType::F32, &device)
+            .expect("failed to load Qwen Image VAE");
+        let input = VaeTensor::new(vec![1, 3, 1, 64, 64], vec![0.0; 3 * 64 * 64]).unwrap();
+        let latent = encoder
+            .encode_qwen_input(&input)
+            .expect("Qwen VAE encoding failed");
+        assert_eq!(latent.shape[0..3], [1, 16, 1]);
+        assert_eq!(latent.shape[3..], [8, 8]);
+        assert!(latent.data.iter().all(|value| value.is_finite()));
     }
 }

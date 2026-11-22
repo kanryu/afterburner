@@ -7,9 +7,11 @@
 
 use std::{
     fs::File,
-    io::{Read, Write},
+    io::{BufWriter, Cursor, Read, Write},
     path::Path,
 };
+
+use memmap2::MmapOptions;
 
 use crate::vae::{VaeError, VaeTensor};
 
@@ -267,37 +269,58 @@ impl InMemoryTrainingCache {
     /// Persists the fully encoded cache without retaining source images or text.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), CacheError> {
         self.validate()?;
-        let mut file = File::create(path)?;
-        file.write_all(CACHE_MAGIC)?;
-        file.write_all(&CACHE_VERSION.to_le_bytes())?;
-        write_u64(&mut file, self.samples.len() as u64)?;
+        let path = path.as_ref();
+        let temporary_path = path.with_extension(format!(
+            "{}tmp",
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| format!("{extension}."))
+                .unwrap_or_default()
+        ));
+        let file = File::create(&temporary_path)?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(CACHE_MAGIC)?;
+        writer.write_all(&CACHE_VERSION.to_le_bytes())?;
+        write_u64(&mut writer, self.samples.len() as u64)?;
         for sample in &self.samples {
-            write_bytes(&mut file, sample.sample_id.as_bytes())?;
-            write_u64(&mut file, sample.repeat_index as u64)?;
-            write_tensor(&mut file, &sample.text_embedding)?;
+            write_bytes(&mut writer, sample.sample_id.as_bytes())?;
+            write_u64(&mut writer, sample.repeat_index as u64)?;
+            write_tensor(&mut writer, &sample.text_embedding)?;
             match &sample.text_attention_mask {
                 Some(mask) => {
-                    file.write_all(&[1])?;
-                    write_tensor(&mut file, mask)?;
+                    writer.write_all(&[1])?;
+                    write_tensor(&mut writer, mask)?;
                 }
-                None => file.write_all(&[0])?,
+                None => writer.write_all(&[0])?,
             }
             match &sample.adapter_conditioning {
                 Some(conditioning) => {
-                    file.write_all(&[1])?;
-                    write_u32_vec(&mut file, &conditioning.input_ids)?;
-                    write_tensor(&mut file, &conditioning.attention_mask)?;
+                    writer.write_all(&[1])?;
+                    write_u32_vec(&mut writer, &conditioning.input_ids)?;
+                    write_tensor(&mut writer, &conditioning.attention_mask)?;
                 }
-                None => file.write_all(&[0])?,
+                None => writer.write_all(&[0])?,
             }
-            write_tensor(&mut file, &sample.image_latent)?;
+            write_tensor(&mut writer, &sample.image_latent)?;
         }
+        writer.flush()?;
+        let file = writer
+            .into_inner()
+            .map_err(|error| CacheError::Io(error.into_error()))?;
+        file.sync_all()?;
+        drop(file);
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        std::fs::rename(&temporary_path, path)?;
         Ok(())
     }
 
     /// Restores a cache produced by [`Self::save`].
     pub fn load(path: impl AsRef<Path>) -> Result<Self, CacheError> {
-        let mut file = File::open(path)?;
+        let file = File::open(path)?;
+        let mapped = unsafe { MmapOptions::new().map(&file)? };
+        let mut file = Cursor::new(&mapped[..]);
         let mut magic = [0; 8];
         file.read_exact(&mut magic)?;
         if &magic != CACHE_MAGIC {
@@ -388,12 +411,15 @@ fn write_u32_vec(writer: &mut impl Write, values: &[u32]) -> Result<(), CacheErr
 
 fn read_u32_vec(reader: &mut impl Read) -> Result<Vec<u32>, CacheError> {
     let count = bounded_count(read_u64(reader)?, "adapter token count")?;
-    let mut values = Vec::with_capacity(count);
-    for _ in 0..count {
-        let mut bytes = [0; 4];
-        reader.read_exact(&mut bytes)?;
-        values.push(u32::from_le_bytes(bytes));
-    }
+    let byte_count = count
+        .checked_mul(size_of::<u32>())
+        .ok_or_else(|| CacheError::InvalidFormat("adapter token payload is too large".into()))?;
+    let mut raw = vec![0; byte_count];
+    reader.read_exact(&mut raw)?;
+    let values = raw
+        .chunks_exact(4)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("chunk size is four")))
+        .collect();
     Ok(values)
 }
 
@@ -433,9 +459,13 @@ fn write_tensor(writer: &mut impl Write, tensor: &VaeTensor) -> Result<(), Cache
         write_u64(writer, *dimension as u64)?;
     }
     write_u64(writer, tensor.data.len() as u64)?;
-    for value in &tensor.data {
-        writer.write_all(&value.to_le_bytes())?;
-    }
+    let byte_len = tensor
+        .data
+        .len()
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| CacheError::InvalidFormat("tensor byte length overflow".into()))?;
+    let bytes = unsafe { std::slice::from_raw_parts(tensor.data.as_ptr().cast::<u8>(), byte_len) };
+    writer.write_all(bytes)?;
     Ok(())
 }
 
@@ -446,12 +476,15 @@ fn read_tensor(reader: &mut impl Read) -> Result<VaeTensor, CacheError> {
         shape.push(bounded_count(read_u64(reader)?, "tensor dimension")?);
     }
     let count = bounded_count(read_u64(reader)?, "tensor element count")?;
-    let mut data = Vec::with_capacity(count);
-    for _ in 0..count {
-        let mut bytes = [0; 4];
-        reader.read_exact(&mut bytes)?;
-        data.push(f32::from_le_bytes(bytes));
-    }
+    let byte_count = count
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| CacheError::InvalidFormat("tensor payload is too large".into()))?;
+    let mut raw = vec![0; byte_count];
+    reader.read_exact(&mut raw)?;
+    let data = raw
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("chunk size is four")))
+        .collect();
     Ok(VaeTensor::new(shape, data)?)
 }
 

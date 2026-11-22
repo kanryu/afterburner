@@ -67,19 +67,44 @@ impl core::fmt::Debug for Graph {
 
 static STATE: spin::Mutex<Option<GraphLocator>> = spin::Mutex::new(None);
 
-pub(crate) fn cleanup_dead_nodes() {
-    let mut state = STATE.lock();
-    let Some(locator) = state.as_mut() else {
-        return;
-    };
+#[cfg(feature = "std")]
+std::thread_local! {
+    static LOCAL_SERVERS: std::cell::RefCell<Vec<AutodiffServer>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
 
-    let graphs: Vec<Arc<Graph>> = locator.graphs.values().cloned().collect();
+pub(crate) struct LocalGraphGuard;
+
+impl LocalGraphGuard {
+    pub(crate) fn enter() -> Self {
+        #[cfg(feature = "std")]
+        LOCAL_SERVERS.with(|servers| servers.borrow_mut().push(AutodiffServer::default()));
+        Self
+    }
+}
+
+impl Drop for LocalGraphGuard {
+    fn drop(&mut self) {
+        #[cfg(feature = "std")]
+        LOCAL_SERVERS.with(|servers| {
+            servers.borrow_mut().pop();
+        });
+    }
+}
+
+pub(crate) fn cleanup_dead_nodes() {
+    let graphs: Vec<Arc<Graph>> = {
+        let state = STATE.lock();
+        let Some(locator) = state.as_ref() else {
+            return;
+        };
+        locator.graphs.values().cloned().collect()
+    };
     for graph in graphs {
         let mut graph_state = graph.state.lock().unwrap();
         graph_state.server.sweep_dead_nodes();
     }
-
-    locator.prune_empty_graphs();
+    prune_empty_graphs_global();
 }
 
 impl GraphMutexClient {
@@ -109,7 +134,30 @@ impl GraphMutexClient {
 
 impl AutodiffClient for GraphMutexClient {
     fn register(&self, node_id_ref: NodeRefCount, step: StepBoxed, actions: CheckpointerBuilder) {
+        let mut step = Some(step);
+        let mut actions = Some(actions);
+        #[cfg(feature = "std")]
+        {
+            let handled = LOCAL_SERVERS.with(|servers| {
+                let mut servers = servers.borrow_mut();
+                if let Some(server) = servers.last_mut() {
+                    server.register(
+                        node_id_ref.clone(),
+                        step.take().expect("local step already consumed"),
+                        actions.take().expect("local actions already consumed"),
+                    );
+                    true
+                } else {
+                    false
+                }
+            });
+            if handled {
+                return;
+            }
+        }
         let node_id = *node_id_ref;
+        let step = step.expect("global step already consumed");
+        let actions = actions.expect("global actions already consumed");
         let graph = GraphMutexClient::graph(node_id, step.parents());
         let mut state = graph.state.lock().unwrap();
 
@@ -122,6 +170,14 @@ impl AutodiffClient for GraphMutexClient {
         step: StepBoxed,
         actions: CheckpointerBuilder,
     ) {
+        #[cfg(feature = "std")]
+        {
+            let local = LOCAL_SERVERS.with(|servers| !servers.borrow().is_empty());
+            if local {
+                self.register(node_id_ref, step, actions);
+                return;
+            }
+        }
         let node_id = *node_id_ref;
         // Register normally (might be needed by tracked children, required for checkpointing)
         self.register(node_id_ref, step, actions);
@@ -134,6 +190,8 @@ impl AutodiffClient for GraphMutexClient {
     }
 
     fn backward<B: Backend>(&self, root: AutodiffTensor<B>) -> Gradients {
+        let debug_cleanup = std::env::var_os("AFTERBURNER_DEBUG_GRAPH_CLEANUP").is_some();
+        let backward_started = std::time::Instant::now();
         let node_id = root.node.id;
         let graph = GraphMutexClient::graph(root.node.id, &[]);
 
@@ -141,6 +199,12 @@ impl AutodiffClient for GraphMutexClient {
         let mut state = graph.state.lock().unwrap();
 
         let grads = state.server.backward::<GraphCleaner>(grads, node_id);
+        if debug_cleanup {
+            eprintln!(
+                "[graph-cleanup] server_backward_complete elapsed={:.3}s",
+                backward_started.elapsed().as_secs_f64()
+            );
+        }
 
         // The backward server owns the temporary Steps and checkpoint builders
         // for this graph. Release the mutex before compacting the global
@@ -149,10 +213,63 @@ impl AutodiffClient for GraphMutexClient {
         core::mem::drop(state);
 
         let mut cleaner = GraphCleaner::init();
+        let cleanup_started = std::time::Instant::now();
         cleaner.cleanup_orphaned_entries();
-        cleaner.prune_empty_graphs();
+        if debug_cleanup {
+            eprintln!(
+                "[graph-cleanup] orphan_cleanup_complete elapsed={:.3}s total={:.3}s",
+                cleanup_started.elapsed().as_secs_f64(),
+                backward_started.elapsed().as_secs_f64()
+            );
+        }
+        // Do not hold GraphCleaner::guard while taking graph state locks.
+        // The previous lock order (global STATE -> graph.state) could wait
+        // forever when a local checkpoint graph was being finalized.
+        core::mem::drop(cleaner);
+        prune_empty_graphs_global();
+        if debug_cleanup {
+            eprintln!(
+                "[graph-cleanup] prune_complete elapsed={:.3}s total={:.3}s",
+                cleanup_started.elapsed().as_secs_f64(),
+                backward_started.elapsed().as_secs_f64()
+            );
+        }
 
         grads
+    }
+
+}
+
+struct NoopCleaner;
+
+impl NodeCleaner for NoopCleaner {
+    fn init() -> Self { Self }
+    fn clean(&mut self, _node: &NodeId) {}
+}
+
+impl GraphMutexClient {
+    pub(crate) fn backward_local_with_grad<B: Backend>(
+        root: AutodiffTensor<B>,
+        root_grad: B::FloatTensorPrimitive,
+    ) -> Gradients {
+        let node_id = root.node.id;
+        let root_node = root.node.clone();
+        let root_primitive = root.primitive.clone();
+        let mut grads = Gradients::new::<B>(root_node, root_primitive);
+        grads.register::<B>(node_id, root_grad);
+        #[cfg(feature = "std")]
+        {
+            let result = LOCAL_SERVERS.with(|servers| {
+                let mut servers = servers.borrow_mut();
+                servers
+                    .last_mut()
+                    .map(|server| server.backward::<NoopCleaner>(grads, node_id))
+            });
+            if let Some(grads) = result {
+                return grads;
+            }
+        }
+        panic!("backward_local_with_grad called outside LocalGraphGuard");
     }
 }
 
@@ -167,11 +284,6 @@ impl<'a> GraphCleaner<'a> {
         }
     }
 
-    fn prune_empty_graphs(&mut self) {
-        if let Some(state) = self.guard.as_mut() {
-            state.prune_empty_graphs();
-        }
-    }
 }
 
 impl<'a> NodeCleaner for GraphCleaner<'a> {
@@ -374,6 +486,29 @@ impl GraphLocator {
             }
         }
     }
+}
+
+/// Remove empty graph servers without holding the global locator lock while
+/// acquiring an individual graph lock. Local checkpoint backward creates and
+/// destroys many short-lived graphs, so lock ordering here must remain
+/// strictly independent of the graph server locks.
+fn prune_empty_graphs_global() {
+    // Do not inspect graph.state here. Burn's mutex stub has no non-blocking
+    // lock operation, and nested checkpoint backward can still own one of
+    // those states. The locator's key map is the ownership index: once an
+    // origin has no key, no live tensor can reach that graph. Remove those
+    // graph entries directly without waiting on the graph server mutex.
+    let mut state = STATE.lock();
+    let Some(locator) = state.as_mut() else {
+        return;
+    };
+    let live_origins = locator.keys.keys().copied().collect::<HashSet<_>>();
+    locator
+        .graphs
+        .retain(|_, graph| live_origins.contains(&graph.origin));
+    locator
+        .untracked_nodes
+        .retain(|node| locator.graphs.contains_key(node));
 }
 
 /// Represents the analysis result of graph operations for a given node and its parents.

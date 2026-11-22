@@ -142,6 +142,22 @@ where
     S: Clone + Send + core::fmt::Debug + 'static,
     BO: Backward<B, N, State = S>,
 {
+    /// Registers parent relationships without scheduling explicit
+    /// checkpoint/recompute work for compute-bound custom primitives.
+    pub fn parents<'a, B2, A>(self, _parents: A) -> Self
+    where
+        B2: Backend,
+        A: IntoIterator<Item = &'a AutodiffTensor<B2>>,
+    {
+        self
+    }
+
+    /// Stores the current primitive as an explicit computed checkpoint.
+    pub fn checkpoint_computed(&mut self, tensor: &AutodiffTensor<B>) -> NodeId {
+        self.checkpointer_builder.checkpoint_computed(tensor);
+        tensor.node.id
+    }
+
     /// Prepare an operation that requires a state during the backward pass.
     pub fn stateful(self) -> OpsKind<BO, B, S, C, N> {
         match self.requirement.is_none() {
@@ -206,6 +222,12 @@ where
         output.register_step(OpsStep::new(ops, self.backward), self.checkpointer_builder)
     }
 
+    /// Stores the current primitive as an explicit computed checkpoint.
+    pub fn checkpoint_computed(&mut self, tensor: &AutodiffTensor<B>) -> NodeId {
+        self.checkpointer_builder.checkpoint_computed(tensor);
+        tensor.node.id
+    }
+
     /// Checkpoints the tensor
     pub fn checkpoint(&mut self, tensor: &AutodiffTensor<B>) -> NodeId {
         self.checkpointer_builder
@@ -213,6 +235,7 @@ where
 
         tensor.node.id
     }
+
 }
 
 /// Enum used before finishing tracked and untracked operations.
@@ -254,6 +277,14 @@ where
     SB: Clone + Send + core::fmt::Debug + 'static,
 {
     fn step(self: Box<Self>, grads: &mut Gradients, checkpointer: &mut Checkpointer) {
+        if std::env::var_os("AFTERBURNER_DEBUG_AUTODIFF_OPS").is_some() {
+            eprintln!(
+                "[autodiff-op] backward={} node={:?} depth={}",
+                core::any::type_name::<T>(),
+                self.ops.node.id,
+                self.ops.node.order
+            );
+        }
         self.backward.backward(self.ops, grads, checkpointer);
     }
 

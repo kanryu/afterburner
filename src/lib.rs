@@ -23,14 +23,20 @@ pub use anima::{AnimaConfig, AnimaWeightKind, QwenImageVaeConfig};
 pub use cache::{AdapterConditioning, CacheError, CachedTrainingSample, InMemoryTrainingCache};
 pub use dataset::{DatasetError, ImageCaptionDataset, TrainingSample};
 pub use diffusion::{
-    DiffusionError, DiffusionSchedule, LossWeighting, TrainingExample, TrainingTarget,
+    DiffusionError, DiffusionSchedule, LossWeighting, TimestepSampling, TrainingExample,
+    TrainingTarget,
 };
+#[cfg(feature = "cuda")]
+pub use dit::AnimaAttentionCuda;
 pub use dit::{
-    AnimaDiT, AnimaDiTBlock, AnimaDiTBlockConfig, AnimaDiTConfigError, AnimaLlmAdapter,
-    AnimaLlmAdapterBlock, AnimaRmsNorm, AnimaTensorError, AnimaTimestepEmbedder, patchify_latent,
-    unpatchify_latent,
+    AnimaAttentionLayer, AnimaAttentionStandard, AnimaDiT, AnimaDiTBlock, AnimaDiTBlockConfig,
+    AnimaDiTConfigError, AnimaLlmAdapter, AnimaLlmAdapterBlock, AnimaRmsNorm, AnimaTensorError,
+    AnimaTimestepEmbedder, patchify_latent, set_attention_chunk_size, unpatchify_latent,
 };
-pub use logging::{KohyaLogger, NullLogger, StderrLogger, TrainingLogger, log_preparation};
+pub use logging::{
+    KohyaLogger, NullLogger, StderrFileLogger, StderrLogger, TeeWriter, TrainingLogger,
+    log_preparation,
+};
 pub use lora::{LoraConfig, LoraError, LoraLinear, LoraLinearConfig, LoraTarget, LoraTargetKind};
 pub use model::{
     ModelCacheKey, ModelConfig, ModelDescriptor, ModelError, ModelType, resolve_model,
@@ -45,12 +51,13 @@ pub use text::{
     T5Tokenizer, TokenizedCaption,
 };
 pub use training::{
-    LearningRatePolicy, TrainingError, TrainingReport, optimizer_step, optimizer_step_with_config,
+    LearningRatePolicy, ReplayTrainingInput, TrainingError, TrainingReport, optimizer_step, optimizer_step_with_config,
     train_cached, train_cached_with_options, train_cached_with_options_and_logger,
     train_cached_with_options_and_logger_and_checkpoint,
     train_cached_with_options_and_logger_and_checkpoint_with_weighting,
     train_cached_with_options_and_logger_and_checkpoint_with_weighting_and_policy,
     train_cached_with_options_and_logger_and_checkpoint_with_weighting_and_policy_and_step_hook,
+    train_cached_with_replay,
     train_cached_with_target, training_loss, training_loss_with_weighting,
 };
 pub use vae::{
@@ -61,9 +68,10 @@ pub use weights::{
     AnimaLoadReport, AnimaLoraFactorPlan, AnimaLoraPlan, AnimaWeightCoverage, AnimaWeightSlot,
     LoraOutputDtype, QwenImageVaeCoverage, WeightError, export_anima_lora,
     export_anima_lora_with_config, export_anima_lora_with_config_and_dtype,
-    inspect_anima_lora_factors, inspect_anima_lora_file, inspect_anima_weight_coverage,
-    inspect_qwen_image_vae, load_anima_lora_factors, load_anima_lora_linear, load_anima_model,
-    load_anima_weights, map_anima_weight_key,
+    export_anima_lora_with_config_and_dtype_with_attention, inspect_anima_lora_factors,
+    inspect_anima_lora_file, inspect_anima_weight_coverage, inspect_qwen_image_vae,
+    load_anima_lora_factors, load_anima_lora_linear, load_anima_model,
+    load_anima_model_with_attention, load_anima_weights, map_anima_weight_key,
 };
 
 /// Returns the current Afterburner package version.

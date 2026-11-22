@@ -99,6 +99,13 @@ impl CheckpointerBuilder {
         }
     }
 
+    pub(crate) fn checkpoint_computed<B: Backend>(&mut self, tensor: &AutodiffTensor<B>) {
+        self.explicit_actions.push(CheckpointingAction::Computed {
+            node_id: tensor.node.id,
+            state_content: Box::new(tensor.primitive.clone()),
+        });
+    }
+
     pub(crate) fn extend(&mut self, other: CheckpointerBuilder) {
         for other_action in other.explicit_actions {
             self.explicit_actions.push(other_action)

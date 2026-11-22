@@ -1,7 +1,7 @@
 use burn_core as burn;
 
 use burn::tensor::backend::Backend;
-use burn::{config::Config, tensor::Tensor};
+use burn::{config::Config, tensor::{DType, Tensor}};
 
 /// Gradient Clipping provides a way to mitigate exploding gradients
 #[derive(Config, Debug)]
@@ -50,6 +50,14 @@ impl GradientClipping {
     ///
     /// The clipped gradient.
     pub fn clip_gradient<B: Backend, const D: usize>(&self, grad: Tensor<B, D>) -> Tensor<B, D> {
+        // Mixed-precision custom kernels can produce an isolated NaN/Inf in
+        // one reduction lane. Letting that value enter AdamW poisons both
+        // moment buffers and every later parameter update. Preserve all
+        // finite gradient elements and discard only the invalid lanes before
+        // applying the configured clipping policy.
+        let grad = grad
+            .clone()
+            .mask_fill(grad.is_finite().bool_not(), 0.0);
         match self {
             GradientClipping::Value(threshold) => self.clip_by_value(grad, *threshold),
             GradientClipping::Norm(max_norm) => self.clip_by_norm(grad, *max_norm),
@@ -74,10 +82,15 @@ impl GradientClipping {
         grad: Tensor<B, D>,
         threshold: f32,
     ) -> Tensor<B, D> {
-        let norm = Self::l2_norm(grad.clone());
+        // PyTorch/kohya computes max_grad_norm in FP32 even when the model
+        // uses FP16/BF16.  Reducing squared BF16 gradients directly can
+        // overflow and also changes the clipping coefficient materially.
+        let dtype = grad.dtype();
+        let grad_f32 = grad.cast(DType::F32);
+        let norm = Self::l2_norm(grad_f32.clone());
         let clip_coef = threshold / norm.add_scalar(1e-6); // avoid div by zero
         let clip_coef_clamped = clip_coef.clamp_max(1.0);
-        grad.mul(clip_coef_clamped.unsqueeze())
+        grad_f32.mul(clip_coef_clamped.unsqueeze()).cast(dtype)
     }
 
     fn l2_norm<B: Backend, const D: usize>(tensor: Tensor<B, D>) -> Tensor<B, 1> {
