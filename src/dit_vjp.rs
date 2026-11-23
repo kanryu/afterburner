@@ -11,7 +11,6 @@ use burn_autodiff::{
     grads::Gradients,
     ops::{
         attention_backward, attention_forward, lora_linear_backward, lora_linear_forward_inner,
-        LoraLinearGrads,
     },
 };
 
@@ -67,22 +66,23 @@ struct InnerDiTBlockWeights<B: Backend> {
 
 struct AdaLnForwardCache<B: Backend> {
     normalized_act: B::FloatTensorPrimitive,
-    x_hat: B::FloatTensorPrimitive,
-    inv_std: B::FloatTensorPrimitive,
-    scale: B::FloatTensorPrimitive,
-    gate: B::FloatTensorPrimitive,
+    x_hat_f32: B::FloatTensorPrimitive,
+    inv_std_f32: B::FloatTensorPrimitive,
+    scale_f32: B::FloatTensorPrimitive,
+    gate_f32: B::FloatTensorPrimitive,
 }
 
-struct BlockRecomputeCache<B: Backend> {
+struct SelfAttnCache<B: Backend> {
     self_mod: AdaLnForwardCache<B>,
     q_self_pre: B::FloatTensorPrimitive,
     k_self_pre: B::FloatTensorPrimitive,
-    q_self_normed: B::FloatTensorPrimitive,
-    k_self_normed: B::FloatTensorPrimitive,
     q_self_rot: B::FloatTensorPrimitive,
     k_self_rot: B::FloatTensorPrimitive,
     v_self: B::FloatTensorPrimitive,
     self_attended_2d: B::FloatTensorPrimitive,
+}
+
+struct CrossAttnCache<B: Backend> {
     cross_mod: AdaLnForwardCache<B>,
     q_cross_pre: B::FloatTensorPrimitive,
     k_cross_pre: B::FloatTensorPrimitive,
@@ -90,9 +90,30 @@ struct BlockRecomputeCache<B: Backend> {
     k_cross_normed: B::FloatTensorPrimitive,
     v_cross: B::FloatTensorPrimitive,
     cross_attended_2d: B::FloatTensorPrimitive,
+}
+
+struct MlpCache<B: Backend> {
     mlp_mod: AdaLnForwardCache<B>,
     mlp_h1: B::FloatTensorPrimitive,
     mlp_h2: B::FloatTensorPrimitive,
+}
+
+struct BlockRecomputeCache<B: Backend> {
+    self_attn: SelfAttnCache<B>,
+    cross_attn: CrossAttnCache<B>,
+    mlp: MlpCache<B>,
+}
+
+#[inline]
+fn broadcast_if_needed<B: Backend>(
+    tensor: B::FloatTensorPrimitive,
+    target_shape: &Shape,
+) -> B::FloatTensorPrimitive {
+    if &tensor.shape() == target_shape {
+        tensor
+    } else {
+        B::float_expand(tensor, target_shape.clone())
+    }
 }
 
 fn unwrap_autodiff<B: Backend>(tensor: AutodiffTensor<B>) -> (B::FloatTensorPrimitive, NodeRef) {
@@ -201,9 +222,21 @@ fn run_lora_inner<B: Backend>(
     input: B::FloatTensorPrimitive,
 ) -> B::FloatTensorPrimitive {
     let dtype: FloatDType = input.dtype().into();
-    let w = B::float_cast(weights.weight.clone(), dtype);
-    let d = B::float_cast(weights.down.clone(), dtype);
-    let u = B::float_cast(weights.up.clone(), dtype);
+    let w = if weights.weight.dtype() == input.dtype() {
+        weights.weight.clone()
+    } else {
+        B::float_cast(weights.weight.clone(), dtype)
+    };
+    let d = if weights.down.dtype() == input.dtype() {
+        weights.down.clone()
+    } else {
+        B::float_cast(weights.down.clone(), dtype)
+    };
+    let u = if weights.up.dtype() == input.dtype() {
+        weights.up.clone()
+    } else {
+        B::float_cast(weights.up.clone(), dtype)
+    };
     lora_linear_forward_inner::<B>(input, w, d, u, weights.scale)
 }
 
@@ -217,7 +250,6 @@ fn adaln_forward_cached<B: Backend>(
     let shape = input.shape();
     let batch = shape[0];
     let hidden_size = weights.hidden_size;
-    let res_dtype: FloatDType = input.dtype().into();
 
     let h1 = run_lora_inner(&weights.down, condition);
     let h1_silu = B::float_mul(
@@ -228,23 +260,24 @@ fn adaln_forward_cached<B: Backend>(
         )),
     );
     let params = B::float_add(run_lora_inner(&weights.up, h1_silu), timestep_embedding);
+    let params_f32 = B::float_cast(params, FloatDType::F32);
 
     let shift = B::float_slice(
-        params.clone(),
+        params_f32.clone(),
         &[
             Slice::new(0, Some(batch as isize), 1),
             Slice::new(0, Some(hidden_size as isize), 1),
         ],
     );
     let scale = B::float_slice(
-        params.clone(),
+        params_f32.clone(),
         &[
             Slice::new(0, Some(batch as isize), 1),
             Slice::new(hidden_size as isize, Some((hidden_size * 2) as isize), 1),
         ],
     );
     let gate = B::float_slice(
-        params,
+        params_f32,
         &[
             Slice::new(0, Some(batch as isize), 1),
             Slice::new(
@@ -259,68 +292,69 @@ fn adaln_forward_cached<B: Backend>(
     let scale_3d = B::float_reshape(scale, Shape::from([batch, 1, hidden_size]));
     let gate_3d = B::float_reshape(gate, Shape::from([batch, 1, hidden_size]));
 
+    // Compute LayerNorm statistics in F32 so `var + 1e-6` never underflows in BF16.
+    let input_f32 = B::float_cast(input, FloatDType::F32);
     let hidden_f32 = hidden_size as f32;
-    let mean = B::float_div_scalar(B::float_sum_dim(input.clone(), 2), hidden_f32.elem());
-    let mean_exp = B::float_expand(mean, shape.clone());
-    let diff = B::float_sub(input, mean_exp);
+    let mean = B::float_div_scalar(B::float_sum_dim(input_f32.clone(), 2), hidden_f32.elem());
+    let diff = B::float_sub(input_f32, broadcast_if_needed::<B>(mean, &shape));
     let var = B::float_div_scalar(
         B::float_sum_dim(B::float_mul(diff.clone(), diff.clone()), 2),
         hidden_f32.elem(),
     );
     let std = B::float_sqrt(B::float_add_scalar(var, 1e-6_f32.elem()));
-    let inv_std = B::float_recip(std);
-    let inv_std_exp = B::float_expand(inv_std.clone(), shape.clone());
-    let x_hat = B::float_mul(diff, inv_std_exp);
+    let inv_std_f32 = B::float_recip(std);
+    let x_hat_f32 = B::float_mul(diff, broadcast_if_needed::<B>(inv_std_f32.clone(), &shape));
 
-    let scale_plus_one = B::float_expand(B::float_add_scalar(scale_3d.clone(), 1.0_f32.elem()), shape.clone());
-    let shift_exp = B::float_expand(shift_3d, shape);
-    let normalized = B::float_add(B::float_mul(x_hat.clone(), scale_plus_one), shift_exp);
-    let normalized_act = B::float_cast(normalized, activation_dtype);
+    let scale_plus_one =
+        broadcast_if_needed::<B>(B::float_add_scalar(scale_3d.clone(), 1.0_f32.elem()), &shape);
+    let shift_exp = broadcast_if_needed::<B>(shift_3d, &shape);
+    let normalized_f32 = B::float_add(B::float_mul(x_hat_f32.clone(), scale_plus_one), shift_exp);
+    let normalized_act = B::float_cast(normalized_f32, activation_dtype);
 
     AdaLnForwardCache {
         normalized_act,
-        x_hat: B::float_cast(x_hat, res_dtype),
-        inv_std: B::float_cast(inv_std, res_dtype),
-        scale: B::float_cast(scale_3d, res_dtype),
-        gate: B::float_cast(gate_3d, res_dtype),
+        x_hat_f32,
+        inv_std_f32,
+        scale_f32: scale_3d,
+        gate_f32: gate_3d,
     }
 }
 
-fn adaln_input_backward<B: Backend>(
-    d_residual_out: B::FloatTensorPrimitive,
+fn adaln_input_backward_f32<B: Backend>(
+    d_residual_out_f32: B::FloatTensorPrimitive,
     d_sublayer_in_act: B::FloatTensorPrimitive,
     cache: &AdaLnForwardCache<B>,
-    residual_dtype: FloatDType,
 ) -> B::FloatTensorPrimitive {
-    let shape = d_residual_out.shape();
+    let shape = d_residual_out_f32.shape();
     let hidden_f32 = shape[2] as f32;
 
-    let d_z = B::float_cast(d_residual_out, residual_dtype);
-    let d_y = B::float_cast(d_sublayer_in_act, residual_dtype);
-    let scale_plus_one =
-        B::float_expand(B::float_add_scalar(cache.scale.clone(), 1.0_f32.elem()), shape.clone());
+    let d_y = B::float_cast(d_sublayer_in_act, FloatDType::F32);
+    let scale_plus_one = broadcast_if_needed::<B>(
+        B::float_add_scalar(cache.scale_f32.clone(), 1.0_f32.elem()),
+        &shape,
+    );
     let d_x_hat = B::float_mul(d_y, scale_plus_one);
 
-    let mean_dx = B::float_expand(
+    let mean_dx = broadcast_if_needed::<B>(
         B::float_div_scalar(B::float_sum_dim(d_x_hat.clone(), 2), hidden_f32.elem()),
-        shape.clone(),
+        &shape,
     );
-    let mean_dx_xhat = B::float_expand(
+    let mean_dx_xhat = broadcast_if_needed::<B>(
         B::float_div_scalar(
-            B::float_sum_dim(B::float_mul(d_x_hat.clone(), cache.x_hat.clone()), 2),
+            B::float_sum_dim(B::float_mul(d_x_hat.clone(), cache.x_hat_f32.clone()), 2),
             hidden_f32.elem(),
         ),
-        shape.clone(),
+        &shape,
     );
 
     let centered = B::float_sub(
         B::float_sub(d_x_hat, mean_dx),
-        B::float_mul(cache.x_hat.clone(), mean_dx_xhat),
+        B::float_mul(cache.x_hat_f32.clone(), mean_dx_xhat),
     );
-    let inv_std_exp = B::float_expand(cache.inv_std.clone(), shape);
+    let inv_std_exp = broadcast_if_needed::<B>(cache.inv_std_f32.clone(), &shape);
     let d_x_adaln = B::float_mul(inv_std_exp, centered);
 
-    B::float_add(d_z, d_x_adaln)
+    B::float_add(d_residual_out_f32, d_x_adaln)
 }
 
 fn rms_norm_forward_inner<B: Backend>(
@@ -337,7 +371,7 @@ fn rms_norm_forward_inner<B: Backend>(
     let gamma_f32 = B::float_cast(gamma, FloatDType::F32);
     let mut gamma_dims = vec![1; shape.num_dims()];
     gamma_dims[last_dim] = shape[last_dim];
-    let gamma_exp = B::float_expand(B::float_reshape(gamma_f32, Shape::from(gamma_dims)), shape.clone());
+    let gamma_exp = broadcast_if_needed::<B>(B::float_reshape(gamma_f32, Shape::from(gamma_dims)), &shape);
 
     let rms = B::float_sqrt(B::float_add_scalar(
         B::float_div_scalar(
@@ -346,7 +380,7 @@ fn rms_norm_forward_inner<B: Backend>(
         ),
         epsilon.elem(),
     ));
-    let rms_exp = B::float_expand(rms, shape);
+    let rms_exp = broadcast_if_needed::<B>(rms, &shape);
     let out_f32 = B::float_mul(B::float_div(x_f32, rms_exp), gamma_exp);
     B::float_cast(out_f32, input_dtype)
 }
@@ -367,7 +401,7 @@ fn rms_norm_backward_inner<B: Backend>(
     let gamma_f32 = B::float_cast(gamma, FloatDType::F32);
     let mut gamma_dims = vec![1; shape.num_dims()];
     gamma_dims[last_dim] = shape[last_dim];
-    let gamma_exp = B::float_expand(B::float_reshape(gamma_f32, Shape::from(gamma_dims)), shape.clone());
+    let gamma_exp = broadcast_if_needed::<B>(B::float_reshape(gamma_f32, Shape::from(gamma_dims)), &shape);
 
     let rms = B::float_sqrt(B::float_add_scalar(
         B::float_div_scalar(
@@ -376,16 +410,16 @@ fn rms_norm_backward_inner<B: Backend>(
         ),
         epsilon.elem(),
     ));
-    let rms_exp = B::float_expand(rms, shape.clone());
+    let rms_exp = broadcast_if_needed::<B>(rms, &shape);
     let x_hat = B::float_div(x_f32, rms_exp.clone());
     let g = B::float_mul(dy_f32, gamma_exp);
 
-    let dot_mean = B::float_expand(
+    let dot_mean = broadcast_if_needed::<B>(
         B::float_div_scalar(
             B::float_sum_dim(B::float_mul(g.clone(), x_hat.clone()), last_dim),
             feature_count.elem(),
         ),
-        shape,
+        &shape,
     );
     let dx_f32 = B::float_div(B::float_sub(g, B::float_mul(x_hat, dot_mean)), rms_exp);
     B::float_cast(dx_f32, input_dtype)
@@ -462,8 +496,9 @@ fn rotary_forward_inner<B: Backend>(
             Slice::new(half as isize, Some(head_size as isize), 1),
         ],
     );
-    let cos_exp = B::float_expand(cos, first.shape());
-    let sin_exp = B::float_expand(sin, first.shape());
+    let half_shape = first.shape();
+    let cos_exp = broadcast_if_needed::<B>(cos, &half_shape);
+    let sin_exp = broadcast_if_needed::<B>(sin, &half_shape);
     let out_first = B::float_sub(
         B::float_mul(first.clone(), cos_exp.clone()),
         B::float_mul(second.clone(), sin_exp.clone()),
@@ -501,8 +536,9 @@ fn rotary_backward_inner<B: Backend>(
             Slice::new(half as isize, Some(head_size as isize), 1),
         ],
     );
-    let cos_exp = B::float_expand(cos, dy_first.shape());
-    let sin_exp = B::float_expand(sin, dy_first.shape());
+    let half_shape = dy_first.shape();
+    let cos_exp = broadcast_if_needed::<B>(cos, &half_shape);
+    let sin_exp = broadcast_if_needed::<B>(sin, &half_shape);
     let dx_first = B::float_add(
         B::float_mul(dy_first.clone(), cos_exp.clone()),
         B::float_mul(dy_second.clone(), sin_exp.clone()),
@@ -514,6 +550,7 @@ fn rotary_backward_inner<B: Backend>(
     B::float_cat(vec![dx_first, dx_second], 3)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn block_forward_inner<B: Backend>(
     block: &InnerDiTBlockWeights<B>,
     input: B::FloatTensorPrimitive,
@@ -525,6 +562,7 @@ fn block_forward_inner<B: Backend>(
     activation_dtype: FloatDType,
     residual_dtype: FloatDType,
     attention_chunk: usize,
+    build_cache: bool,
 ) -> (B::FloatTensorPrimitive, Option<BlockRecomputeCache<B>>) {
     let shape = input.shape();
     let [batch, seq, hidden_size] = [shape[0], shape[1], shape[2]];
@@ -577,10 +615,10 @@ fn block_forward_inner<B: Backend>(
     );
     let (q_self_rot, k_self_rot) = match &rope {
         Some((cos, sin)) if block.self_attn.use_rotary => (
-            rotary_forward_inner::<B>(q_self_normed.clone(), cos.clone(), sin.clone()),
-            rotary_forward_inner::<B>(k_self_normed.clone(), cos.clone(), sin.clone()),
+            rotary_forward_inner::<B>(q_self_normed, cos.clone(), sin.clone()),
+            rotary_forward_inner::<B>(k_self_normed, cos.clone(), sin.clone()),
         ),
-        _ => (q_self_normed.clone(), k_self_normed.clone()),
+        _ => (q_self_normed, k_self_normed),
     };
     let self_attended = attention_forward::<B>(
         q_self_rot.clone(),
@@ -594,14 +632,18 @@ fn block_forward_inner<B: Backend>(
         B::float_swap_dims(self_attended, 1, 2),
         Shape::from([batch, seq, hidden_size]),
     );
-    let self_out = B::float_cast(
+    let self_out_f32 = B::float_cast(
         run_lora_inner(&block.self_attn.output_proj, self_attended_2d.clone()),
-        residual_dtype,
+        FloatDType::F32,
     );
-    let after_self = B::float_add(
-        input,
-        B::float_mul(self_out, B::float_expand(self_mod.gate.clone(), shape.clone())),
+    let after_self_f32 = B::float_add(
+        B::float_cast(input, FloatDType::F32),
+        B::float_mul(
+            self_out_f32,
+            broadcast_if_needed::<B>(self_mod.gate_f32.clone(), &shape),
+        ),
     );
+    let after_self = B::float_cast(after_self_f32, residual_dtype);
 
     // 2. Cross-Attention stage
     let cross_mod = adaln_forward_cached(
@@ -657,17 +699,18 @@ fn block_forward_inner<B: Backend>(
         B::float_swap_dims(cross_attended, 1, 2),
         Shape::from([batch, seq, hidden_size]),
     );
-    let cross_out = B::float_cast(
+    let cross_out_f32 = B::float_cast(
         run_lora_inner(&block.cross_attn.output_proj, cross_attended_2d.clone()),
-        residual_dtype,
+        FloatDType::F32,
     );
-    let after_cross = B::float_add(
-        after_self,
+    let after_cross_f32 = B::float_add(
+        B::float_cast(after_self, FloatDType::F32),
         B::float_mul(
-            cross_out,
-            B::float_expand(cross_mod.gate.clone(), shape.clone()),
+            cross_out_f32,
+            broadcast_if_needed::<B>(cross_mod.gate_f32.clone(), &shape),
         ),
     );
+    let after_cross = B::float_cast(after_cross_f32, residual_dtype);
 
     // 3. MLP stage
     let mlp_mod = adaln_forward_cached(
@@ -679,35 +722,47 @@ fn block_forward_inner<B: Backend>(
     );
     let mlp_h1 = run_lora_inner(&block.mlp_layer1, mlp_mod.normalized_act.clone());
     let mlp_h2 = B::gelu(mlp_h1.clone());
-    let mlp_out = B::float_cast(
+    let mlp_out_f32 = B::float_cast(
         run_lora_inner(&block.mlp_layer2, mlp_h2.clone()),
-        residual_dtype,
+        FloatDType::F32,
     );
-    let output = B::float_add(
-        after_cross,
-        B::float_mul(mlp_out, B::float_expand(mlp_mod.gate.clone(), shape)),
+    let output_f32 = B::float_add(
+        B::float_cast(after_cross, FloatDType::F32),
+        B::float_mul(
+            mlp_out_f32,
+            broadcast_if_needed::<B>(mlp_mod.gate_f32.clone(), &shape),
+        ),
     );
+    let output = B::float_cast(output_f32, residual_dtype);
+
+    if !build_cache {
+        return (output, None);
+    }
 
     let cache = BlockRecomputeCache {
-        self_mod,
-        q_self_pre,
-        k_self_pre,
-        q_self_normed,
-        k_self_normed,
-        q_self_rot,
-        k_self_rot,
-        v_self,
-        self_attended_2d,
-        cross_mod,
-        q_cross_pre,
-        k_cross_pre,
-        q_cross_normed,
-        k_cross_normed,
-        v_cross,
-        cross_attended_2d,
-        mlp_mod,
-        mlp_h1,
-        mlp_h2,
+        self_attn: SelfAttnCache {
+            self_mod,
+            q_self_pre,
+            k_self_pre,
+            q_self_rot,
+            k_self_rot,
+            v_self,
+            self_attended_2d,
+        },
+        cross_attn: CrossAttnCache {
+            cross_mod,
+            q_cross_pre,
+            k_cross_pre,
+            q_cross_normed,
+            k_cross_normed,
+            v_cross,
+            cross_attended_2d,
+        },
+        mlp: MlpCache {
+            mlp_mod,
+            mlp_h1,
+            mlp_h2,
+        },
     };
     (output, Some(cache))
 }
@@ -726,193 +781,200 @@ fn register_lora_grads<B: Backend>(
 fn block_backward_inner<B: Backend>(
     block: &InnerDiTBlockWeights<B>,
     cache: BlockRecomputeCache<B>,
-    d_output: B::FloatTensorPrimitive,
+    d_output_f32: B::FloatTensorPrimitive,
     text_act: B::FloatTensorPrimitive,
     text_mask: Option<B::FloatTensorPrimitive>,
     rope: Option<(B::FloatTensorPrimitive, B::FloatTensorPrimitive)>,
     activation_dtype: FloatDType,
-    residual_dtype: FloatDType,
     attention_chunk: usize,
     need_prev_dx: bool,
     grads: &mut Gradients,
 ) -> Option<B::FloatTensorPrimitive> {
-    let shape = d_output.shape();
+    let shape = d_output_f32.shape();
     let [batch, seq, hidden_size] = [shape[0], shape[1], shape[2]];
     let heads = block.self_attn.head_count;
     let head_size = block.self_attn.head_size;
     let attn_scale: B::FloatElem = (1.0 / (head_size as f32).sqrt()).elem();
 
-    // --- 1. MLP VJP ---
-    let d_mlp_out_act = B::float_cast(
-        B::float_mul(
-            d_output.clone(),
-            B::float_expand(cache.mlp_mod.gate.clone(), shape.clone()),
-        ),
-        activation_dtype,
-    );
-    let mlp2_grads = lora_linear_backward::<B>(
-        d_mlp_out_act,
-        cache.mlp_h2,
-        block.mlp_layer2.weight.clone(),
-        block.mlp_layer2.down.clone(),
-        block.mlp_layer2.up.clone(),
-        block.mlp_layer2.scale,
-        true,
-    );
-    register_lora_grads(&block.mlp_layer2, mlp2_grads.d_down, mlp2_grads.d_up, grads);
+    let BlockRecomputeCache {
+        self_attn: self_cache,
+        cross_attn: cross_cache,
+        mlp: mlp_cache,
+    } = cache;
 
-    let d_mlp_h1 = B::gelu_backward(cache.mlp_h1, mlp2_grads.d_input.unwrap());
-    let mlp1_grads = lora_linear_backward::<B>(
-        d_mlp_h1,
-        cache.mlp_mod.normalized_act.clone(),
-        block.mlp_layer1.weight.clone(),
-        block.mlp_layer1.down.clone(),
-        block.mlp_layer1.up.clone(),
-        block.mlp_layer1.scale,
-        true,
-    );
-    register_lora_grads(&block.mlp_layer1, mlp1_grads.d_down, mlp1_grads.d_up, grads);
+    // --- 1. MLP VJP (and drop MLP cache immediately after) ---
+    let d_after_cross_f32 = {
+        let d_mlp_out_act = B::float_cast(
+            B::float_mul(
+                d_output_f32.clone(),
+                broadcast_if_needed::<B>(mlp_cache.mlp_mod.gate_f32.clone(), &shape),
+            ),
+            activation_dtype,
+        );
+        let mlp2_grads = lora_linear_backward::<B>(
+            d_mlp_out_act,
+            mlp_cache.mlp_h2,
+            block.mlp_layer2.weight.clone(),
+            block.mlp_layer2.down.clone(),
+            block.mlp_layer2.up.clone(),
+            block.mlp_layer2.scale,
+            true,
+        );
+        register_lora_grads(&block.mlp_layer2, mlp2_grads.d_down, mlp2_grads.d_up, grads);
 
-    let d_after_cross = adaln_input_backward::<B>(
-        d_output,
-        mlp1_grads.d_input.unwrap(),
-        &cache.mlp_mod,
-        residual_dtype,
-    );
+        let d_mlp_h1 = B::gelu_backward(mlp_cache.mlp_h1, mlp2_grads.d_input.unwrap());
+        let mlp1_grads = lora_linear_backward::<B>(
+            d_mlp_h1,
+            mlp_cache.mlp_mod.normalized_act.clone(),
+            block.mlp_layer1.weight.clone(),
+            block.mlp_layer1.down.clone(),
+            block.mlp_layer1.up.clone(),
+            block.mlp_layer1.scale,
+            true,
+        );
+        register_lora_grads(&block.mlp_layer1, mlp1_grads.d_down, mlp1_grads.d_up, grads);
 
-    // --- 2. Cross-Attention VJP ---
-    let d_cross_out_act = B::float_cast(
-        B::float_mul(
-            d_after_cross.clone(),
-            B::float_expand(cache.cross_mod.gate.clone(), shape.clone()),
-        ),
-        activation_dtype,
-    );
-    let cross_o_grads = lora_linear_backward::<B>(
-        d_cross_out_act,
-        cache.cross_attended_2d,
-        block.cross_attn.output_proj.weight.clone(),
-        block.cross_attn.output_proj.down.clone(),
-        block.cross_attn.output_proj.up.clone(),
-        block.cross_attn.output_proj.scale,
-        true,
-    );
-    register_lora_grads(
-        &block.cross_attn.output_proj,
-        cross_o_grads.d_down,
-        cross_o_grads.d_up,
-        grads,
-    );
+        adaln_input_backward_f32::<B>(
+            d_output_f32,
+            mlp1_grads.d_input.unwrap(),
+            &mlp_cache.mlp_mod,
+        )
+    };
 
-    let d_cross_attended = B::float_swap_dims(
-        B::float_reshape(
-            cross_o_grads.d_input.unwrap(),
-            Shape::from([batch, seq, heads, head_size]),
-        ),
-        1,
-        2,
-    );
-    let (d_q_cross_normed, d_k_cross_normed, d_v_cross) = attention_backward::<B>(
-        d_cross_attended,
-        cache.q_cross_normed,
-        cache.k_cross_normed.clone(),
-        cache.v_cross,
-        text_mask,
-        attn_scale,
-        attention_chunk,
-    );
-    let d_q_cross_pre = rms_norm_backward_inner::<B>(
-        d_q_cross_normed,
-        cache.q_cross_pre,
-        block.cross_attn.q_gamma.clone(),
-        block.cross_attn.rms_eps,
-    );
-    let d_q_cross_2d = B::float_reshape(
-        B::float_swap_dims(d_q_cross_pre, 1, 2),
-        Shape::from([batch, seq, hidden_size]),
-    );
-    let cross_q_grads = lora_linear_backward::<B>(
-        d_q_cross_2d,
-        cache.cross_mod.normalized_act.clone(),
-        block.cross_attn.q_proj.weight.clone(),
-        block.cross_attn.q_proj.down.clone(),
-        block.cross_attn.q_proj.up.clone(),
-        block.cross_attn.q_proj.scale,
-        true,
-    );
-    register_lora_grads(
-        &block.cross_attn.q_proj,
-        cross_q_grads.d_down,
-        cross_q_grads.d_up,
-        grads,
-    );
+    // --- 2. Cross-Attention VJP (and drop Cross-Attention cache immediately after) ---
+    let d_after_self_f32 = {
+        let d_cross_out_act = B::float_cast(
+            B::float_mul(
+                d_after_cross_f32.clone(),
+                broadcast_if_needed::<B>(cross_cache.cross_mod.gate_f32.clone(), &shape),
+            ),
+            activation_dtype,
+        );
+        let cross_o_grads = lora_linear_backward::<B>(
+            d_cross_out_act,
+            cross_cache.cross_attended_2d,
+            block.cross_attn.output_proj.weight.clone(),
+            block.cross_attn.output_proj.down.clone(),
+            block.cross_attn.output_proj.up.clone(),
+            block.cross_attn.output_proj.scale,
+            true,
+        );
+        register_lora_grads(
+            &block.cross_attn.output_proj,
+            cross_o_grads.d_down,
+            cross_o_grads.d_up,
+            grads,
+        );
 
-    // k_proj and v_proj take frozen `text_act`; `d_text` is not needed, so skip dX.
-    let d_k_cross_pre = rms_norm_backward_inner::<B>(
-        d_k_cross_normed,
-        cache.k_cross_pre,
-        block.cross_attn.k_gamma.clone(),
-        block.cross_attn.rms_eps,
-    );
-    let text_len = text_act.shape()[1];
-    let d_k_cross_2d = B::float_reshape(
-        B::float_swap_dims(d_k_cross_pre, 1, 2),
-        Shape::from([batch, text_len, hidden_size]),
-    );
-    let cross_k_grads = lora_linear_backward::<B>(
-        d_k_cross_2d,
-        text_act.clone(),
-        block.cross_attn.k_proj.weight.clone(),
-        block.cross_attn.k_proj.down.clone(),
-        block.cross_attn.k_proj.up.clone(),
-        block.cross_attn.k_proj.scale,
-        false,
-    );
-    register_lora_grads(
-        &block.cross_attn.k_proj,
-        cross_k_grads.d_down,
-        cross_k_grads.d_up,
-        grads,
-    );
+        let d_cross_attended = B::float_swap_dims(
+            B::float_reshape(
+                cross_o_grads.d_input.unwrap(),
+                Shape::from([batch, seq, heads, head_size]),
+            ),
+            1,
+            2,
+        );
+        let (d_q_cross_normed, d_k_cross_normed, d_v_cross) = attention_backward::<B>(
+            d_cross_attended,
+            cross_cache.q_cross_normed,
+            cross_cache.k_cross_normed,
+            cross_cache.v_cross,
+            text_mask,
+            attn_scale,
+            attention_chunk,
+        );
+        let d_q_cross_pre = rms_norm_backward_inner::<B>(
+            d_q_cross_normed,
+            cross_cache.q_cross_pre,
+            block.cross_attn.q_gamma.clone(),
+            block.cross_attn.rms_eps,
+        );
+        let d_q_cross_2d = B::float_reshape(
+            B::float_swap_dims(d_q_cross_pre, 1, 2),
+            Shape::from([batch, seq, hidden_size]),
+        );
+        let cross_q_grads = lora_linear_backward::<B>(
+            d_q_cross_2d,
+            cross_cache.cross_mod.normalized_act.clone(),
+            block.cross_attn.q_proj.weight.clone(),
+            block.cross_attn.q_proj.down.clone(),
+            block.cross_attn.q_proj.up.clone(),
+            block.cross_attn.q_proj.scale,
+            true,
+        );
+        register_lora_grads(
+            &block.cross_attn.q_proj,
+            cross_q_grads.d_down,
+            cross_q_grads.d_up,
+            grads,
+        );
 
-    let d_v_cross_2d = B::float_reshape(
-        B::float_swap_dims(d_v_cross, 1, 2),
-        Shape::from([batch, text_len, hidden_size]),
-    );
-    let cross_v_grads = lora_linear_backward::<B>(
-        d_v_cross_2d,
-        text_act,
-        block.cross_attn.v_proj.weight.clone(),
-        block.cross_attn.v_proj.down.clone(),
-        block.cross_attn.v_proj.up.clone(),
-        block.cross_attn.v_proj.scale,
-        false,
-    );
-    register_lora_grads(
-        &block.cross_attn.v_proj,
-        cross_v_grads.d_down,
-        cross_v_grads.d_up,
-        grads,
-    );
+        // Pass pre-norm `k_cross_pre` (not post-norm) to `rms_norm_backward_inner`.
+        let d_k_cross_pre = rms_norm_backward_inner::<B>(
+            d_k_cross_normed,
+            cross_cache.k_cross_pre,
+            block.cross_attn.k_gamma.clone(),
+            block.cross_attn.rms_eps,
+        );
+        let text_len = text_act.shape()[1];
+        let d_k_cross_2d = B::float_reshape(
+            B::float_swap_dims(d_k_cross_pre, 1, 2),
+            Shape::from([batch, text_len, hidden_size]),
+        );
+        let cross_k_grads = lora_linear_backward::<B>(
+            d_k_cross_2d,
+            text_act.clone(),
+            block.cross_attn.k_proj.weight.clone(),
+            block.cross_attn.k_proj.down.clone(),
+            block.cross_attn.k_proj.up.clone(),
+            block.cross_attn.k_proj.scale,
+            false,
+        );
+        register_lora_grads(
+            &block.cross_attn.k_proj,
+            cross_k_grads.d_down,
+            cross_k_grads.d_up,
+            grads,
+        );
 
-    let d_after_self = adaln_input_backward::<B>(
-        d_after_cross,
-        cross_q_grads.d_input.unwrap(),
-        &cache.cross_mod,
-        residual_dtype,
-    );
+        let d_v_cross_2d = B::float_reshape(
+            B::float_swap_dims(d_v_cross, 1, 2),
+            Shape::from([batch, text_len, hidden_size]),
+        );
+        let cross_v_grads = lora_linear_backward::<B>(
+            d_v_cross_2d,
+            text_act,
+            block.cross_attn.v_proj.weight.clone(),
+            block.cross_attn.v_proj.down.clone(),
+            block.cross_attn.v_proj.up.clone(),
+            block.cross_attn.v_proj.scale,
+            false,
+        );
+        register_lora_grads(
+            &block.cross_attn.v_proj,
+            cross_v_grads.d_down,
+            cross_v_grads.d_up,
+            grads,
+        );
+
+        adaln_input_backward_f32::<B>(
+            d_after_cross_f32,
+            cross_q_grads.d_input.unwrap(),
+            &cross_cache.cross_mod,
+        )
+    };
 
     // --- 3. Self-Attention VJP ---
     let d_self_out_act = B::float_cast(
         B::float_mul(
-            d_after_self.clone(),
-            B::float_expand(cache.self_mod.gate.clone(), shape),
+            d_after_self_f32.clone(),
+            broadcast_if_needed::<B>(self_cache.self_mod.gate_f32.clone(), &shape),
         ),
         activation_dtype,
     );
     let self_o_grads = lora_linear_backward::<B>(
         d_self_out_act,
-        cache.self_attended_2d,
+        self_cache.self_attended_2d,
         block.self_attn.output_proj.weight.clone(),
         block.self_attn.output_proj.down.clone(),
         block.self_attn.output_proj.up.clone(),
@@ -936,9 +998,9 @@ fn block_backward_inner<B: Backend>(
     );
     let (d_q_self_rot, d_k_self_rot, d_v_self) = attention_backward::<B>(
         d_self_attended,
-        cache.q_self_rot,
-        cache.k_self_rot,
-        cache.v_self,
+        self_cache.q_self_rot,
+        self_cache.k_self_rot,
+        self_cache.v_self,
         None,
         attn_scale,
         attention_chunk,
@@ -952,13 +1014,13 @@ fn block_backward_inner<B: Backend>(
     };
     let d_q_self_pre = rms_norm_backward_inner::<B>(
         d_q_self_normed,
-        cache.q_self_pre,
+        self_cache.q_self_pre,
         block.self_attn.q_gamma.clone(),
         block.self_attn.rms_eps,
     );
     let d_k_self_pre = rms_norm_backward_inner::<B>(
         d_k_self_normed,
-        cache.k_self_pre,
+        self_cache.k_self_pre,
         block.self_attn.k_gamma.clone(),
         block.self_attn.rms_eps,
     );
@@ -978,7 +1040,7 @@ fn block_backward_inner<B: Backend>(
 
     let self_q_grads = lora_linear_backward::<B>(
         d_q_self_2d,
-        cache.self_mod.normalized_act.clone(),
+        self_cache.self_mod.normalized_act.clone(),
         block.self_attn.q_proj.weight.clone(),
         block.self_attn.q_proj.down.clone(),
         block.self_attn.q_proj.up.clone(),
@@ -994,7 +1056,7 @@ fn block_backward_inner<B: Backend>(
 
     let self_k_grads = lora_linear_backward::<B>(
         d_k_self_2d,
-        cache.self_mod.normalized_act.clone(),
+        self_cache.self_mod.normalized_act.clone(),
         block.self_attn.k_proj.weight.clone(),
         block.self_attn.k_proj.down.clone(),
         block.self_attn.k_proj.up.clone(),
@@ -1010,7 +1072,7 @@ fn block_backward_inner<B: Backend>(
 
     let self_v_grads = lora_linear_backward::<B>(
         d_v_self_2d,
-        cache.self_mod.normalized_act.clone(),
+        self_cache.self_mod.normalized_act.clone(),
         block.self_attn.v_proj.weight.clone(),
         block.self_attn.v_proj.down.clone(),
         block.self_attn.v_proj.up.clone(),
@@ -1032,11 +1094,10 @@ fn block_backward_inner<B: Backend>(
         B::float_add(self_q_grads.d_input.unwrap(), self_k_grads.d_input.unwrap()),
         self_v_grads.d_input.unwrap(),
     );
-    Some(adaln_input_backward::<B>(
-        d_after_self,
+    Some(adaln_input_backward_f32::<B>(
+        d_after_self_f32,
         d_self_in,
-        &cache.self_mod,
-        residual_dtype,
+        &self_cache.self_mod,
     ))
 }
 
@@ -1143,6 +1204,7 @@ where
             activation_dtype,
             residual_dtype,
             attention_chunk,
+            false,
         );
         current_hidden = next_hidden;
         block_weights.push(w);
@@ -1151,7 +1213,8 @@ where
     let input_node_id: Option<NodeId> = input_requires_grad.then_some(hidden_node.id);
     let backward_fn = Box::new(
         move |grad_output: B::FloatTensorPrimitive, grads: &mut Gradients| {
-            let mut d_hidden = grad_output;
+            // Keep residual stream gradient in F32 across all 28 blocks.
+            let mut d_hidden_f32 = B::float_cast(grad_output, FloatDType::F32);
             for block_idx in (0..block_weights.len()).rev() {
                 let need_prev_dx = block_idx > 0 || input_node_id.is_some();
                 let w = &block_weights[block_idx];
@@ -1167,26 +1230,26 @@ where
                     activation_dtype,
                     residual_dtype,
                     attention_chunk,
+                    true,
                 );
                 let cache = cache.expect("block recompute cache must be produced");
-                if let Some(prev_d_hidden) = block_backward_inner::<B>(
+                if let Some(prev_d_hidden_f32) = block_backward_inner::<B>(
                     w,
                     cache,
-                    d_hidden.clone(),
+                    d_hidden_f32.clone(),
                     text_act.clone(),
                     mask_raw.clone(),
                     rope.clone(),
                     activation_dtype,
-                    residual_dtype,
                     attention_chunk,
                     need_prev_dx,
                     grads,
                 ) {
-                    d_hidden = prev_d_hidden;
+                    d_hidden_f32 = prev_d_hidden_f32;
                 }
             }
             if let Some(in_id) = input_node_id {
-                let dx_final = B::float_cast(d_hidden, activation_dtype);
+                let dx_final = B::float_cast(d_hidden_f32, activation_dtype);
                 grads.register::<B>(in_id, dx_final);
             }
         },
@@ -1212,7 +1275,9 @@ mod tests {
     type Inner = NdArray<f32>;
     type AdBackend = Autodiff<Inner, NoCheckpointing>;
 
-    fn build_test_block(device: &<AdBackend as Backend>::Device) -> AnimaDiTBlock<AdBackend, AnimaAttentionCuda<AdBackend>> {
+    fn build_test_block(
+        device: &<AdBackend as Backend>::Device,
+    ) -> AnimaDiTBlock<AdBackend, AnimaAttentionCuda<AdBackend>> {
         let config = AnimaDiTBlockConfig {
             hidden_size: 12,
             context_size: 12,
@@ -1222,7 +1287,8 @@ mod tests {
             lora_rank: 2,
             lora_alpha: 2,
         };
-        let mut block = AnimaDiTBlock::<AdBackend, AnimaAttentionCuda<AdBackend>>::init(&config, device).unwrap();
+        let mut block =
+            AnimaDiTBlock::<AdBackend, AnimaAttentionCuda<AdBackend>>::init(&config, device).unwrap();
         let eye12 = Tensor::<AdBackend, 2>::eye(12, device);
         let ones2 = Tensor::<AdBackend, 2>::ones([2, 12], device).mul_scalar(0.05);
         let ones2_out = Tensor::<AdBackend, 2>::ones([12, 2], device).mul_scalar(0.05);
@@ -1241,11 +1307,15 @@ mod tests {
             proj.lora_down = Param::from_tensor(ones2.clone());
             proj.lora_up = Param::from_tensor(ones2_out.clone());
         }
-        block.mlp_layer1.weight = Param::from_tensor(Tensor::ones([24, 12], device).mul_scalar(0.1));
+        block.mlp_layer1.weight =
+            Param::from_tensor(Tensor::ones([24, 12], device).mul_scalar(0.1));
         block.mlp_layer1.lora_down = Param::from_tensor(ones2.clone());
-        block.mlp_layer1.lora_up = Param::from_tensor(Tensor::ones([24, 2], device).mul_scalar(0.05));
-        block.mlp_layer2.weight = Param::from_tensor(Tensor::ones([12, 24], device).mul_scalar(0.1));
-        block.mlp_layer2.lora_down = Param::from_tensor(Tensor::ones([2, 24], device).mul_scalar(0.05));
+        block.mlp_layer1.lora_up =
+            Param::from_tensor(Tensor::ones([24, 2], device).mul_scalar(0.05));
+        block.mlp_layer2.weight =
+            Param::from_tensor(Tensor::ones([12, 24], device).mul_scalar(0.1));
+        block.mlp_layer2.lora_down =
+            Param::from_tensor(Tensor::ones([2, 24], device).mul_scalar(0.05));
         block.mlp_layer2.lora_up = Param::from_tensor(ones2_out);
         block
     }
@@ -1269,7 +1339,9 @@ mod tests {
             alpha: 2,
             ..Default::default()
         };
-        let mut model = AnimaDiT::<AdBackend, AnimaAttentionCuda<AdBackend>>::init(&config, &lora, &device).unwrap();
+        let mut model =
+            AnimaDiT::<AdBackend, AnimaAttentionCuda<AdBackend>>::init(&config, &lora, &device)
+                .unwrap();
         model.blocks[0] = build_test_block(&device);
         model.blocks[1] = build_test_block(&device);
 
@@ -1279,13 +1351,15 @@ mod tests {
         let temb_data: Vec<f32> = (0..36).map(|i| (i as f32 * 0.01) - 0.15).collect();
         let grad_weights_data: Vec<f32> = (0..48).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
 
-        let hidden_ref = Tensor::<AdBackend, 3>::from_data(TensorData::new(hidden_data.clone(), [1, 4, 12]), &device).require_grad();
+        let hidden_ref =
+            Tensor::<AdBackend, 3>::from_data(TensorData::new(hidden_data.clone(), [1, 4, 12]), &device)
+                .require_grad();
         let text = Tensor::<AdBackend, 3>::from_data(TensorData::new(text_data, [1, 3, 12]), &device);
         let cond = Tensor::<AdBackend, 2>::from_data(TensorData::new(cond_data, [1, 12]), &device);
         let temb = Tensor::<AdBackend, 2>::from_data(TensorData::new(temb_data, [1, 36]), &device);
-        let weights = Tensor::<AdBackend, 3>::from_data(TensorData::new(grad_weights_data, [1, 4, 12]), &device);
+        let weights =
+            Tensor::<AdBackend, 3>::from_data(TensorData::new(grad_weights_data, [1, 4, 12]), &device);
 
-        // Reference Autodiff forward + backward
         let mut out_ref = hidden_ref.clone();
         for block in &model.blocks {
             out_ref = block.forward_with_text_mask_and_spatial(
@@ -1300,8 +1374,9 @@ mod tests {
         let loss_ref = (out_ref.clone() * weights.clone()).sum();
         let mut grads_ref = loss_ref.backward();
 
-        // Manual VJP forward + backward
-        let hidden_vjp = Tensor::<AdBackend, 3>::from_data(TensorData::new(hidden_data, [1, 4, 12]), &device).require_grad();
+        let hidden_vjp =
+            Tensor::<AdBackend, 3>::from_data(TensorData::new(hidden_data, [1, 4, 12]), &device)
+                .require_grad();
         let out_vjp = forward_dit_blocks_manual_vjp(
             &model.blocks,
             hidden_vjp.clone(),
@@ -1314,21 +1389,18 @@ mod tests {
         let loss_vjp = (out_vjp.clone() * weights).sum();
         let mut grads_vjp = loss_vjp.backward();
 
-        // 1. Forward output parity
         let out_ref_vec = out_ref.into_data().to_vec::<f32>().unwrap();
         let out_vjp_vec = out_vjp.into_data().to_vec::<f32>().unwrap();
         for (a, b) in out_ref_vec.iter().zip(&out_vjp_vec) {
             assert!((a - b).abs() < 1e-4, "forward mismatch: {a} vs {b}");
         }
 
-        // 2. Input d_hidden parity
         let dx_ref = hidden_ref.grad(&grads_ref).unwrap().into_data().to_vec::<f32>().unwrap();
         let dx_vjp = hidden_vjp.grad(&grads_vjp).unwrap().into_data().to_vec::<f32>().unwrap();
         for (a, b) in dx_ref.iter().zip(&dx_vjp) {
             assert!((a - b).abs() < 1e-4, "dx mismatch: {a} vs {b}");
         }
 
-        // 3. All 20 LoRA factor gradients across all blocks parity
         let mut ids = Vec::new();
         for block in &model.blocks {
             for layer in [

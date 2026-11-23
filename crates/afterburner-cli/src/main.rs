@@ -121,6 +121,26 @@ macro_rules! eprintln {
     }};
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptimizerKind {
+    AdamW,
+    AdamW8bit,
+}
+
+impl std::str::FromStr for OptimizerKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "adamw" => Ok(Self::AdamW),
+            "adamw8bit" | "adamw_8bit" | "adamw-8bit" => Ok(Self::AdamW8bit),
+            other => Err(format!(
+                "unknown optimizer: {other} (expected adamw or adamw8bit)"
+            )),
+        }
+    }
+}
+
 fn load_replay_inputs(
     directory: impl AsRef<Path>,
     _cache: &afterburner::InMemoryTrainingCache,
@@ -546,6 +566,7 @@ fn run() {
     // size and optimizer state within the intended 16 GiB class.
     let mut lora_rank = 8usize;
     let mut lora_alpha = 16usize;
+    let mut optimizer_kind = OptimizerKind::AdamW;
     #[cfg(feature = "bf16")]
     let mut lora_dtype = "bf16".to_owned();
     #[cfg(all(not(feature = "bf16"), feature = "f16"))]
@@ -719,6 +740,15 @@ fn run() {
             if let Some(value) = args.next() {
                 lora_dtype = value;
             }
+        } else if argument == "--optimizer" {
+            optimizer_kind = args
+                .next()
+                .unwrap_or_else(|| "adamw".to_owned())
+                .parse()
+                .unwrap_or_else(|error: String| {
+                    eprintln!("{error}");
+                    std::process::exit(2);
+                });
         } else if argument == "--preprocess-dtype" {
             if let Some(value) = args.next() {
                 preprocess_dtype = value;
@@ -1645,19 +1675,21 @@ fn run() {
         println!("timestep_sampling={timestep_sampling:?}");
         let optimizer_epsilon = 1e-8_f32;
         println!("optimizer_epsilon={optimizer_epsilon:.1e}");
-        println!("optimizer=AdamW8bit");
-        println!("optimizer_state=int8_blockwise");
-        println!("optimizer_state_quantization=Q8S");
-        println!("optimizer_master_parameters=f32");
+        println!("optimizer={optimizer_kind:?}");
+        match optimizer_kind {
+            OptimizerKind::AdamW => {
+                println!("optimizer_state=gpu_fp32");
+                println!("optimizer_state_quantization=none");
+                println!("optimizer_master_parameters=f32");
+            }
+            OptimizerKind::AdamW8bit => {
+                println!("optimizer_state=int8_blockwise");
+                println!("optimizer_state_quantization=Q8S");
+                println!("optimizer_master_parameters=f32");
+            }
+        }
         println!("optimizer_weight_decay=0");
         println!("loss_scale=1");
-        let optimizer_config = burn_optim::AdamW8bitConfig::new()
-            .with_beta_1(0.9)
-            .with_beta_2(0.999)
-            .with_epsilon(optimizer_epsilon)
-            // kohya_ss's AdamW8bit with an empty optimizer_args uses the
-            // bitsandbytes default: no decoupled weight decay.
-            .with_weight_decay(0.0);
         if max_grad_norm > 0.0 {
             // kohya_ss uses global gradient-norm clipping (`max_grad_norm`),
             // not per-element value clipping.  The latter changes the
@@ -1666,7 +1698,6 @@ fn run() {
             // implementation sanitizes invalid lanes before reduction.
             println!("gradient_clipping=global_norm");
         }
-        let mut optimizer = optimizer_config.init::<TrainBackend, TrainModel>();
         let mut logger = afterburner::StderrFileLogger::open(&log_path)
             .expect("failed to open session log file");
         let checkpoint_lora = lora.clone();
@@ -1832,26 +1863,48 @@ fn run() {
         let memory_hook: Option<&mut dyn FnMut(usize, &'static str)> = Some(&mut memory_hook);
         #[cfg(not(feature = "cuda"))]
         let memory_hook: Option<&mut dyn FnMut(usize, &'static str)> = None;
-        let (model, report) =
-            afterburner::train_cached_with_replay(
-                &mut optimizer,
-                model,
-                &cache,
-                &schedule,
-                optimization_steps,
-                learning_rate_policy,
-                seed,
-                target,
-                timestep_sampling,
-                lora.clone(),
-                &mut logger,
-                (checkpoint_every > 0).then_some(checkpoint_every),
-                checkpoint,
-                loss_weighting,
-                memory_hook,
-                replay_inputs.as_deref(),
-            )
-            .expect("cached training failed");
+        macro_rules! run_training {
+            ($optimizer:expr) => {{
+                let mut optimizer = $optimizer;
+                afterburner::train_cached_with_replay(
+                    &mut optimizer,
+                    model,
+                    &cache,
+                    &schedule,
+                    optimization_steps,
+                    learning_rate_policy,
+                    seed,
+                    target,
+                    timestep_sampling,
+                    lora.clone(),
+                    &mut logger,
+                    (checkpoint_every > 0).then_some(checkpoint_every),
+                    checkpoint,
+                    loss_weighting,
+                    memory_hook,
+                    replay_inputs.as_deref(),
+                )
+                .expect("cached training failed")
+            }};
+        }
+        let (model, report) = match optimizer_kind {
+            OptimizerKind::AdamW => {
+                let config = burn_optim::AdamWConfig::new()
+                    .with_beta_1(0.9)
+                    .with_beta_2(0.999)
+                    .with_epsilon(optimizer_epsilon)
+                    .with_weight_decay(0.0);
+                run_training!(config.init::<TrainBackend, TrainModel>())
+            }
+            OptimizerKind::AdamW8bit => {
+                let config = burn_optim::AdamW8bitConfig::new()
+                    .with_beta_1(0.9)
+                    .with_beta_2(0.999)
+                    .with_epsilon(optimizer_epsilon)
+                    .with_weight_decay(0.0);
+                run_training!(config.init::<TrainBackend, TrainModel>())
+            }
+        };
         let factor_count = afterburner::export_anima_lora_with_config_and_dtype_with_attention(
             output_lora,
             &model,

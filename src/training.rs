@@ -1,7 +1,7 @@
 //! Burn training-step glue for cached diffusion examples.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use burn::module::{Module, ModuleVisitor, Param, ParamId};
 use burn::tensor::{
@@ -22,13 +22,6 @@ use crate::{
 };
 
 static TRAIN_DUMP_STEP: AtomicUsize = AtomicUsize::new(0);
-static LAST_HOST_LOSS: AtomicU32 = AtomicU32::new(0);
-
-fn last_host_loss() -> Option<f32> {
-    let value = f32::from_bits(LAST_HOST_LOSS.load(Ordering::Relaxed));
-    value.is_finite().then_some(value)
-}
-
 fn dump_training_tensor<B: burn::tensor::backend::Backend, const D: usize>(
     step: usize,
     name: &str,
@@ -369,21 +362,6 @@ where
         });
     }
     let loss = B::mixed_l2_loss(prediction, target);
-    // The loss backend already promotes both operands to FP32 and reduces the
-    // MSE on the device.  Only materialize that one-element result for the
-    // progress logger.  Reading prediction and target here would synchronize
-    // and copy 2 * 16 * 128 * 128 values on every step, stalling the CUDA
-    // stream and defeating the Python training loop's scalar reduction.
-    if let Ok(values) = loss
-        .clone()
-        .to_data()
-        .convert::<f32>()
-        .to_vec::<f32>()
-    {
-        if let Some(value) = values.first().copied() {
-            LAST_HOST_LOSS.store(value.to_bits(), Ordering::Relaxed);
-        }
-    }
     dump_training_tensor(dump_step, "loss", &loss);
     let weight = loss_weight_for_sigma(weighting, example.sigma);
     Ok(loss.mul_scalar(weight))
@@ -1377,22 +1355,6 @@ where
         if std::env::var_os("AFTERBURNER_DEBUG_FORWARD").is_some() {
             logger.info("[debug] loss forward complete");
         }
-        let values = loss
-            .to_data()
-            .convert::<f32>()
-            // The mixed-dtype loss deliberately reduces in F32 even when the
-            // model tensors use BF16. Read the scalar using its actual dtype;
-            // using B::FloatElem here makes BF16 builds request a BF16 view of
-            // an F32 TensorData and raises a runtime TypeMismatch.
-            .to_vec::<f32>()
-            .map_err(|error| TrainingError::Metrics(format!("{error:?}")))?;
-        last_loss = last_host_loss().or_else(|| values.first().map(|value| value.elem::<f32>()));
-        let loss_value = last_loss.unwrap_or_default();
-        loss_window.push_back(loss_value);
-        if loss_window.len() > 20 {
-            loss_window.pop_front();
-        }
-        let loss_average = loss_window.iter().sum::<f32>() / loss_window.len() as f32;
         let effective_learning_rate = learning_rate_policy.learning_rate(step);
         if debug_param_ids {
             let ids = trainable_lora_ids(&model, &lora);
@@ -1413,12 +1375,6 @@ where
             ));
             previous_param_ids = Some(ids);
         }
-        logger.info(&format!(
-            "steps: {}/{} ({:.0}%), loss={loss_value:.6}, loss_avg20={loss_average:.6}, lr={effective_learning_rate:.3e}",
-            step + 1,
-            steps,
-            ((step + 1) as f32 / steps.max(1) as f32) * 100.0
-        ));
         let optimizer_started = std::time::Instant::now();
         if std::env::var_os("AFTERBURNER_COMPACT_PROGRESS").is_none() {
             logger.info(&format!(
@@ -1436,7 +1392,28 @@ where
         if std::env::var_os("AFTERBURNER_DEBUG_FORWARD").is_some() {
             logger.info("[debug] backward and optimizer started");
         }
+        let loss_handle = loss.clone();
         model = optimizer_step_with_config(optimizer, model, loss, effective_learning_rate, &lora)?;
+        let loss_value = loss_handle
+            .to_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .map_err(|error| TrainingError::Metrics(format!("{error:?}")))?
+            .first()
+            .copied()
+            .unwrap_or_default();
+        last_loss = Some(loss_value);
+        loss_window.push_back(loss_value);
+        if loss_window.len() > 20 {
+            loss_window.pop_front();
+        }
+        let loss_average = loss_window.iter().sum::<f32>() / loss_window.len() as f32;
+        logger.info(&format!(
+            "steps: {}/{} ({:.0}%), loss={loss_value:.6}, loss_avg20={loss_average:.6}, lr={effective_learning_rate:.3e}",
+            step + 1,
+            steps,
+            ((step + 1) as f32 / steps.max(1) as f32) * 100.0
+        ));
         if std::env::var_os("AFTERBURNER_COMPACT_PROGRESS").is_none() {
             logger.info(&format!(
                 "[progress] step={}/{} phase=backward_optimizer_complete elapsed={:.3}s",
