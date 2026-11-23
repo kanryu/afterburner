@@ -14,7 +14,7 @@ use crate::{
         strategy::CheckpointStrategy,
     },
     grads::Gradients,
-    graph::NodeId,
+    graph::{NodeId, Requirement},
     tensor::AutodiffTensor,
 };
 use burn_tensor::{FloatDType, TensorMetadata, backend::Backend};
@@ -118,7 +118,7 @@ fn query_slice<B: Backend>(
     )
 }
 
-fn attention_forward<B: Backend>(
+pub fn attention_forward<B: Backend>(
     query: B::FloatTensorPrimitive,
     key: B::FloatTensorPrimitive,
     value: B::FloatTensorPrimitive,
@@ -138,6 +138,70 @@ fn attention_forward<B: Backend>(
         outputs.push(softmax::<B>(q, key.clone(), value.clone(), mask.clone(), scale).0);
     }
     B::float_cat(outputs, 2)
+}
+
+/// Backend-only scaled-dot-product attention VJP.
+///
+/// This path contains no graph or checkpoint objects and is intended for the
+/// block-level manual backward implementation.
+pub fn attention_backward<B: Backend>(
+    grad_output: B::FloatTensorPrimitive,
+    query: B::FloatTensorPrimitive,
+    key: B::FloatTensorPrimitive,
+    value: B::FloatTensorPrimitive,
+    mask: Option<B::FloatTensorPrimitive>,
+    scale: B::FloatElem,
+    query_chunk_size: usize,
+) -> (B::FloatTensorPrimitive, B::FloatTensorPrimitive, B::FloatTensorPrimitive) {
+    let query_dtype: FloatDType = query.dtype().into();
+    let key_dtype: FloatDType = key.dtype().into();
+    let value_dtype: FloatDType = value.dtype().into();
+    let backward_dtype = if std::env::var_os("AFTERBURNER_ATTENTION_BACKWARD_F32").is_some() {
+        FloatDType::F32
+    } else {
+        query_dtype
+    };
+    let key = B::float_cast(key, backward_dtype);
+    let value = B::float_cast(value, backward_dtype);
+    let mask = mask.map(|mask| B::float_cast(mask, backward_dtype));
+    let query_length = query.shape()[2];
+    let chunk_size = query_chunk_size.max(1).min(query_length.max(1));
+    let mut d_queries = Vec::new();
+    let mut d_key = None;
+    let mut d_value = None;
+    for start in (0..query_length).step_by(chunk_size) {
+        let end = (start + chunk_size).min(query_length);
+        let q = B::float_cast(query_slice::<B>(query.clone(), start, end), backward_dtype);
+        let go = B::float_cast(query_slice::<B>(grad_output.clone(), start, end), backward_dtype);
+        let (_, weights) = softmax::<B>(q.clone(), key.clone(), value.clone(), mask.clone(), scale);
+        let dv = B::float_matmul(B::float_swap_dims(weights.clone(), 2, 3), go.clone());
+        let dw = B::float_matmul(go, B::float_swap_dims(value.clone(), 2, 3));
+        let shape = weights.shape();
+        let row = B::float_expand(
+            B::float_sum_dim(B::float_mul(dw.clone(), weights.clone()), 3),
+            [shape[0], shape[1], shape[2], 1].into(),
+        );
+        let ds = B::float_mul(weights, B::float_sub(dw, row));
+        let dq = B::float_mul_scalar(B::float_matmul(ds.clone(), key.clone()), scale);
+        let dk = B::float_mul_scalar(
+            B::float_matmul(B::float_swap_dims(ds, 2, 3), q),
+            scale,
+        );
+        d_queries.push(dq);
+        d_key = Some(match d_key {
+            Some(value) => B::float_add(value, dk),
+            None => dk,
+        });
+        d_value = Some(match d_value {
+            Some(value) => B::float_add(value, dv),
+            None => dv,
+        });
+    }
+    (
+        B::float_cast(B::float_cat(d_queries, 2), query_dtype),
+        B::float_cast(d_key.expect("attention produced no key gradient"), key_dtype),
+        B::float_cast(d_value.expect("attention produced no value gradient"), value_dtype),
+    )
 }
 
 impl<B: Backend> Backward<B, 3> for FusedAttentionBackward {
@@ -173,70 +237,23 @@ impl<B: Backend> Backward<B, 3> for FusedAttentionBackward {
         let query = checkpointer.retrieve_node_output::<B::FloatTensorPrimitive>(query_node);
         let key = checkpointer.retrieve_node_output::<B::FloatTensorPrimitive>(key_node);
         let value = checkpointer.retrieve_node_output::<B::FloatTensorPrimitive>(value_node);
-        // Keep the backward workspace in the activation dtype by default.
-        // Materializing full FP32 copies of K/V here is numerically convenient
-        // but needlessly raises the CUDA high-water mark. The diagnostic
-        // override preserves the old FP32 workspace for comparison runs.
-        let query_gradient_dtype: FloatDType = query.dtype().into();
-        let key_gradient_dtype: FloatDType = key.dtype().into();
-        let value_gradient_dtype: FloatDType = value.dtype().into();
-        let backward_dtype = if std::env::var_os("AFTERBURNER_ATTENTION_BACKWARD_F32").is_some() {
-            FloatDType::F32
-        } else {
-            query_gradient_dtype
-        };
-        let key = B::float_cast(key, backward_dtype);
-        let value = B::float_cast(value, backward_dtype);
-        let mask = mask.map(|mask| B::float_cast(mask, backward_dtype));
-        let query_length = query.shape()[2];
-        let chunk_size = query_chunk_size.max(1).min(query_length.max(1));
-        let mut d_queries = Vec::new();
-        let mut d_key = None;
-        let mut d_value = None;
-        for start in (0..query_length).step_by(chunk_size) {
-            let end = (start + chunk_size).min(query_length);
-            let q = B::float_cast(query_slice::<B>(query.clone(), start, end), backward_dtype);
-            let go = B::float_cast(
-                query_slice::<B>(grad_output.clone(), start, end),
-                backward_dtype,
-            );
-            let (_, weights) =
-                softmax::<B>(q.clone(), key.clone(), value.clone(), mask.clone(), scale);
-            let dv = B::float_matmul(B::float_swap_dims(weights.clone(), 2, 3), go.clone());
-            let dw = B::float_matmul(go, B::float_swap_dims(value.clone(), 2, 3));
-            let shape = weights.shape();
-            let row = B::float_expand(
-                B::float_sum_dim(B::float_mul(dw.clone(), weights.clone()), 3),
-                [shape[0], shape[1], shape[2], 1].into(),
-            );
-            let ds = B::float_mul(weights, B::float_sub(dw, row));
-            let dq = B::float_mul_scalar(B::float_matmul(ds.clone(), key.clone()), scale);
-            let dk = B::float_mul_scalar(
-                B::float_matmul(B::float_swap_dims(ds, 2, 3), q),
-                scale,
-            );
-            d_queries.push(dq);
-            d_key = Some(match d_key {
-                Some(value) => B::float_add(value, dk),
-                None => dk,
-            });
-            d_value = Some(match d_value {
-                Some(value) => B::float_add(value, dv),
-                None => dv,
-            });
-        }
-        let d_query = B::float_cat(d_queries, 2);
-        let d_key = d_key.expect("fused attention produced no key gradient");
-        let d_value = d_value.expect("fused attention produced no value gradient");
-
+        let (d_query, d_key, d_value) = attention_backward::<B>(
+            grad_output,
+            query,
+            key,
+            value,
+            mask,
+            scale,
+            query_chunk_size,
+        );
         if let Some(node) = ops.parents[0].as_ref() {
-            grads.register::<B>(node.id, B::float_cast(d_query, query_gradient_dtype));
+            grads.register::<B>(node.id, d_query);
         }
         if let Some(node) = ops.parents[1].as_ref() {
-            grads.register::<B>(node.id, B::float_cast(d_key, key_gradient_dtype));
+            grads.register::<B>(node.id, d_key);
         }
         if let Some(node) = ops.parents[2].as_ref() {
-            grads.register::<B>(node.id, B::float_cast(d_value, value_gradient_dtype));
+            grads.register::<B>(node.id, d_value);
         }
         if debug_backward {
             eprintln!(
@@ -244,6 +261,7 @@ impl<B: Backend> Backward<B, 3> for FusedAttentionBackward {
                 started.elapsed().as_millis()
             );
         }
+        // The direct VJP above is the sole backward implementation.
     }
 }
 
@@ -330,4 +348,60 @@ pub fn fused_attention_with_mask_and_chunk<B: Backend, C: CheckpointStrategy>(
         }
         OpsKind::UnTracked(prep) => prep.finish(output),
     }
+}
+
+/// Attention operation backed by a direct InnerBackend VJP.
+///
+/// The forward pass creates one outer node, but never builds an inner
+/// Autodiff tape. Backward reconstructs the softmax tiles with
+/// `attention_backward` and registers gradients directly into the outer
+/// graph. This is the same boundary used by the block-level checkpoint path.
+pub fn fused_attention_manual<B: Backend>(
+    query: AutodiffTensor<B>,
+    key: AutodiffTensor<B>,
+    value: AutodiffTensor<B>,
+    mask: Option<AutodiffTensor<B>>,
+    scale: B::FloatElem,
+    query_chunk_size: usize,
+) -> AutodiffTensor<B> {
+    let output = attention_forward::<B>(
+        query.primitive.clone(),
+        key.primitive.clone(),
+        value.primitive.clone(),
+        mask.as_ref().map(|m| m.primitive.clone()),
+        scale,
+        query_chunk_size,
+    );
+    let query_node = query.node.clone();
+    let key_node = key.node.clone();
+    let value_node = value.node.clone();
+    let query_value = query.primitive;
+    let key_value = key.primitive;
+    let value_value = value.primitive;
+    let mask_value = mask.map(|m| m.primitive);
+    let parents = vec![query_node.clone(), key_node.clone(), value_node.clone()];
+    crate::checkpoint_block::register_manual_vjp::<B, 4>(
+        output,
+        &parents,
+        Box::new(move |grad, grads| {
+            let (d_query, d_key, d_value) = attention_backward::<B>(
+                grad,
+                query_value,
+                key_value,
+                value_value,
+                mask_value,
+                scale,
+                query_chunk_size,
+            );
+            if !matches!(query_node.requirement, Requirement::None) {
+                grads.register::<B>(query_node.id, d_query);
+            }
+            if !matches!(key_node.requirement, Requirement::None) {
+                grads.register::<B>(key_node.id, d_key);
+            }
+            if !matches!(value_node.requirement, Requirement::None) {
+                grads.register::<B>(value_node.id, d_value);
+            }
+        }),
+    )
 }

@@ -31,6 +31,36 @@ pub struct CheckpointBlockStep<B: Backend, const OUT_RANK: usize> {
     >,
 }
 
+/// A checkpoint step whose backward is implemented directly on the inner
+/// backend. The closure receives the upstream gradient and must register all
+/// parent gradients into the outer graph.
+pub struct ManualVjpStep<B: Backend, const OUT_RANK: usize> {
+    output_node: NodeRef,
+    parents: Vec<Parent>,
+    backward_fn: Box<dyn FnOnce(B::FloatTensorPrimitive, &mut Gradients) + Send>,
+}
+
+impl<B: Backend, const OUT_RANK: usize> fmt::Debug for ManualVjpStep<B, OUT_RANK> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ManualVjpStep")
+            .field("output_node", &self.output_node.id)
+            .field("parents", &self.parents.len())
+            .field("out_rank", &OUT_RANK)
+            .finish()
+    }
+}
+
+impl<B: Backend, const OUT_RANK: usize> Step for ManualVjpStep<B, OUT_RANK> {
+    fn step(self: Box<Self>, grads: &mut Gradients, _checkpointer: &mut Checkpointer) {
+        let output_gradient = grads.consume::<B>(&self.output_node);
+        (self.backward_fn)(output_gradient, grads);
+    }
+
+    fn node(&self) -> NodeId { self.output_node.id }
+    fn parents(&self) -> &[Parent] { &self.parents }
+    fn depth(&self) -> usize { self.output_node.order }
+}
+
 impl<B: Backend, const OUT_RANK: usize> fmt::Debug for CheckpointBlockStep<B, OUT_RANK> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CheckpointBlockStep")
@@ -106,4 +136,41 @@ pub fn register_dynamic_checkpoint<B: Backend, const OUT_RANK: usize>(
         recompute_fn,
     };
     result.register_step(step, CheckpointerBuilder::default())
+}
+
+/// Registers a backend-only checkpoint step. Unlike
+/// `register_dynamic_checkpoint`, this never creates a local Autodiff graph.
+pub fn register_manual_checkpoint<B: Backend, const OUT_RANK: usize>(
+    output: B::FloatTensorPrimitive,
+    parent_nodes: &[NodeRef],
+    backward_fn: Box<dyn FnOnce(B::FloatTensorPrimitive, &mut Gradients) + Send>,
+) -> AutodiffTensor<B> {
+    let parents = parent_nodes
+        .iter()
+        .filter_map(|node| node.clone_if_require_grad())
+        .collect::<Vec<_>>();
+    if parents.is_empty() {
+        return AutodiffTensor::new(output);
+    }
+    let result = AutodiffTensor::from_parents(
+        output,
+        &parents,
+        Requirement::Grad,
+        crate::graph::ComputingProperty::ComputeBound,
+    );
+    let step: ManualVjpStep<B, OUT_RANK> = ManualVjpStep {
+        output_node: result.node.clone(),
+        parents: result.node.parents.clone(),
+        backward_fn,
+    };
+    result.register_step(step, CheckpointerBuilder::default())
+}
+
+/// Registers one backend-only manual VJP node.
+pub fn register_manual_vjp<B: Backend, const OUT_RANK: usize>(
+    output: B::FloatTensorPrimitive,
+    parent_nodes: &[NodeRef],
+    backward_fn: Box<dyn FnOnce(B::FloatTensorPrimitive, &mut Gradients) + Send>,
+) -> AutodiffTensor<B> {
+    register_manual_checkpoint::<B, OUT_RANK>(output, parent_nodes, backward_fn)
 }

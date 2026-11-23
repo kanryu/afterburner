@@ -996,7 +996,11 @@ impl<B: Backend> ModuleVisitor<B> for LoraCollector<B> {
             ));
         }
         let tensor = param.val();
-        let data = match tensor.to_data().to_vec::<B::FloatElem>() {
+        // Burn's CUDA BF16 backend can expose BF16 storage while its generic
+        // backend element type is F32. Normalize through TensorData conversion
+        // before serializing; otherwise export fails with a runtime
+        // `expected F32, got BF16` mismatch after an otherwise successful run.
+        let data = match tensor.to_data().convert::<f32>().to_vec::<f32>() {
             Ok(values) => values
                 .iter()
                 .map(|value| value.elem::<f32>())

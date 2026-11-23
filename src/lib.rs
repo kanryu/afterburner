@@ -9,6 +9,8 @@ pub mod cache;
 pub mod dataset;
 pub mod diffusion;
 pub mod dit;
+#[cfg(feature = "cuda")]
+pub mod dit_vjp;
 pub mod logging;
 pub mod lora;
 pub mod model;

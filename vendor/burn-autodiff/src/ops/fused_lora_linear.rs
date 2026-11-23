@@ -16,6 +16,89 @@ use burn_tensor::{FloatDType, Shape, TensorMetadata, backend::Backend};
 
 const LORA_BACKWARD_ROW_CHUNK: usize = 256;
 
+/// Gradients produced by the backend-only LoRA VJP.
+pub struct LoraLinearGrads<B: Backend> {
+    pub d_input: Option<B::FloatTensorPrimitive>,
+    pub d_down: B::FloatTensorPrimitive,
+    pub d_up: B::FloatTensorPrimitive,
+}
+
+/// Computes the VJP of `x W^T + scale * (x A^T) B^T` without creating an
+/// Autodiff graph. This is shared by the normal fused operation and the
+/// block-level manual backward path.
+#[allow(clippy::too_many_arguments)]
+pub fn lora_linear_backward<B: Backend>(
+    grad: B::FloatTensorPrimitive,
+    input_value: B::FloatTensorPrimitive,
+    weight_value: B::FloatTensorPrimitive,
+    down_value: B::FloatTensorPrimitive,
+    up_value: B::FloatTensorPrimitive,
+    scale: B::FloatElem,
+    need_dx: bool,
+) -> LoraLinearGrads<B> {
+    let input_shape = input_value.shape();
+    let input_dtype: FloatDType = input_value.dtype().into();
+    let down_dtype: FloatDType = down_value.dtype().into();
+    let up_dtype: FloatDType = up_value.dtype().into();
+    let backward_dtype = if std::env::var_os("AFTERBURNER_LORA_BACKWARD_F32").is_some()
+        || matches!(input_dtype, FloatDType::F32)
+    {
+        FloatDType::F32
+    } else {
+        input_dtype
+    };
+
+    let grad = B::float_cast(grad, backward_dtype);
+    let input = B::float_cast(input_value, backward_dtype);
+    let weight = B::float_cast(weight_value, backward_dtype);
+    let down = B::float_cast(down_value, backward_dtype);
+    let up = B::float_cast(up_value, backward_dtype);
+    let grad_shape = grad.shape();
+    let grad = if grad_shape.num_dims() == 3 {
+        B::float_reshape(grad, Shape::from([grad_shape[0] * grad_shape[1], grad_shape[2]]))
+    } else {
+        grad
+    };
+    let input = if input_shape.num_dims() == 3 {
+        B::float_reshape(input, Shape::from([input_shape[0] * input_shape[1], input_shape[2]]))
+    } else {
+        input
+    };
+
+    let d_input = if need_dx {
+        let low_grad = B::float_matmul(grad.clone(), up.clone());
+        let value = chunked_input_gradient::<B>(
+            grad.clone(), weight, low_grad, down.clone(), scale,
+        );
+        let value = if input_shape.num_dims() == 3 {
+            B::float_reshape(value, input_shape.clone())
+        } else {
+            value
+        };
+        Some(B::float_cast(value, input_dtype))
+    } else {
+        None
+    };
+
+    let low = B::float_matmul(input.clone(), B::float_transpose(down));
+    let d_up = B::float_cast(
+        B::float_mul_scalar(
+            B::float_transpose(chunked_factor_gradient::<B>(low, grad.clone())),
+            scale,
+        ),
+        up_dtype,
+    );
+    let d_down = B::float_cast(
+        B::float_mul_scalar(
+            chunked_factor_gradient::<B>(B::float_matmul(grad, up), input),
+            scale,
+        ),
+        down_dtype,
+    );
+
+    LoraLinearGrads { d_input, d_down, d_up }
+}
+
 #[derive(Clone, Debug)]
 struct LoraState<B: Backend> {
     input: Option<NodeId>,
@@ -68,6 +151,17 @@ fn forward<B: Backend>(
     } else {
         output
     }
+}
+
+/// Backend-only LoRA forward used by block-level manual VJPs.
+pub fn lora_linear_forward_inner<B: Backend>(
+    input: B::FloatTensorPrimitive,
+    weight: B::FloatTensorPrimitive,
+    down: B::FloatTensorPrimitive,
+    up: B::FloatTensorPrimitive,
+    scale: B::FloatElem,
+) -> B::FloatTensorPrimitive {
+    forward::<B>(input, weight, down, up, scale)
 }
 
 fn row_slice<B: Backend>(
@@ -188,6 +282,34 @@ impl<B: Backend> Backward<B, 4> for FusedLoraBackward {
             .or(state.weight_value)
             .expect("fused LoRA weight state is missing");
         let scale = state.scale;
+
+        // Training freezes the base projection weight. Use the backend-only
+        // VJP for this common path so the same implementation is exercised by
+        // the upcoming block-level manual backward.
+        if ops.parents[1].is_none() {
+            let manual = lora_linear_backward::<B>(
+                grad,
+                input_value,
+                weight_value,
+                down_value,
+                up_value,
+                scale,
+                ops.parents[0].is_some(),
+            );
+            if let Some(node) = ops.parents[0].as_ref() {
+                grads.register::<B>(
+                    node.id,
+                    manual.d_input.expect("LoRA input gradient was not produced"),
+                );
+            }
+            if let Some(node) = ops.parents[2].as_ref() {
+                grads.register::<B>(node.id, manual.d_down);
+            }
+            if let Some(node) = ops.parents[3].as_ref() {
+                grads.register::<B>(node.id, manual.d_up);
+            }
+            return;
+        }
         // The output gradient is commonly BF16, while LoRA factors are kept
         // in F32 (matching kohya's autocast behavior).  Keep the destination
         // dtype per parent instead of using the output gradient dtype for all
@@ -330,6 +452,52 @@ pub fn fused_lora_linear<B: Backend, C: CheckpointStrategy>(
             scale,
         )),
     }
+}
+
+/// LoRA linear operation backed by a manual InnerBackend VJP.
+pub fn fused_lora_linear_manual<B: Backend, C: CheckpointStrategy>(
+    input: AutodiffTensor<B>,
+    weight: AutodiffTensor<B>,
+    down: AutodiffTensor<B>,
+    up: AutodiffTensor<B>,
+    scale: B::FloatElem,
+) -> AutodiffTensor<B> {
+    if weight.is_tracked() {
+        return fused_lora_linear::<B, C>(input, weight, down, up, scale);
+    }
+    let output = forward::<B>(
+        input.primitive.clone(),
+        weight.primitive.clone(),
+        down.primitive.clone(),
+        up.primitive.clone(),
+        scale,
+    );
+    let parents = vec![input.node.clone(), down.node.clone(), up.node.clone()];
+    let input_value = input.primitive;
+    let weight_value = weight.primitive;
+    let down_value = down.primitive;
+    let up_value = up.primitive;
+    let input_id = input.node.id;
+    let down_id = down.node.id;
+    let up_id = up.node.id;
+    crate::checkpoint_block::register_manual_vjp::<B, 3>(
+        output,
+        &parents,
+        Box::new(move |grad, grads| {
+            let result = lora_linear_backward::<B>(
+                grad,
+                input_value,
+                weight_value,
+                down_value,
+                up_value,
+                scale,
+                true,
+            );
+            grads.register::<B>(input_id, result.d_input.expect("manual LoRA input gradient missing"));
+            grads.register::<B>(down_id, result.d_down);
+            grads.register::<B>(up_id, result.d_up);
+        }),
+    )
 }
 
 /// LoRA linear operation whose output is recomputed when a memory-bound

@@ -215,6 +215,66 @@ where B: Backend + BlockCheckpointBackend, C: CheckpointStrategy,
         let out=register_dynamic_checkpoint::<B,3>(raw,&parents,Box::new(move||{ let mut bridges=Vec::new(); let i=input_snap.into_local(&mut bridges); let block=AnimaDiTBlock::<LocalB<B>,A::LocalAttn>{ self_attn:A::restore(snap.self_attn,&mut bridges), cross_attn:A::restore(snap.cross_attn,&mut bridges), mlp_layer1:snap.mlp_layer1.into_local(&mut bridges), mlp_layer2:snap.mlp_layer2.into_local(&mut bridges), self_attn_modulation:snap.self_attn_modulation.into_local(&mut bridges), cross_attn_modulation:snap.cross_attn_modulation.into_local(&mut bridges), mlp_modulation:snap.mlp_modulation.into_local(&mut bridges) }; (block.forward_with_text_mask_and_spatial(i.input,i.text,i.condition,i.timestep_embedding,i.text_mask,i.spatial),bridges) }));
         Tensor::from_primitive(TensorPrimitive::Float(out))
     }
+
+    pub(crate) fn forward_segment_checkpointed(
+        blocks: &[&Self],
+        inputs: AnimaDiTBlockInputs<Autodiff<B, C>>,
+    ) -> Tensor<Autodiff<B, C>, 3> {
+        assert!(!blocks.is_empty());
+        let (inner_in, input_snap, mut parents) = inputs.split();
+        let snapshots = blocks
+            .iter()
+            .map(|block| block.capture_checkpoint(&mut parents))
+            .collect::<Vec<_>>();
+
+        let mut hidden = inner_in.input;
+        for block in blocks {
+            let inner = block.checkpoint_inner();
+            hidden = inner.forward_with_text_mask_and_spatial(
+                hidden,
+                inner_in.text.clone(),
+                inner_in.condition.clone(),
+                inner_in.timestep_embedding.clone(),
+                inner_in.text_mask.clone(),
+                inner_in.spatial,
+            );
+        }
+        let raw = match hidden.into_primitive() {
+            TensorPrimitive::Float(value) => value,
+            TensorPrimitive::QFloat(_) => panic!("quantized output unsupported"),
+        };
+
+        let out = register_dynamic_checkpoint::<B, 3>(
+            raw,
+            &parents,
+            Box::new(move || {
+                let mut bridges = Vec::new();
+                let local_input = input_snap.into_local(&mut bridges);
+                let mut hidden = local_input.input;
+                for snapshot in snapshots {
+                    let block = AnimaDiTBlock::<LocalB<B>, A::LocalAttn> {
+                        self_attn: A::restore(snapshot.self_attn, &mut bridges),
+                        cross_attn: A::restore(snapshot.cross_attn, &mut bridges),
+                        mlp_layer1: snapshot.mlp_layer1.into_local(&mut bridges),
+                        mlp_layer2: snapshot.mlp_layer2.into_local(&mut bridges),
+                        self_attn_modulation: snapshot.self_attn_modulation.into_local(&mut bridges),
+                        cross_attn_modulation: snapshot.cross_attn_modulation.into_local(&mut bridges),
+                        mlp_modulation: snapshot.mlp_modulation.into_local(&mut bridges),
+                    };
+                    hidden = block.forward_with_text_mask_and_spatial(
+                        hidden,
+                        local_input.text.clone(),
+                        local_input.condition.clone(),
+                        local_input.timestep_embedding.clone(),
+                        local_input.text_mask.clone(),
+                        local_input.spatial,
+                    );
+                }
+                (hidden, bridges)
+            }),
+        );
+        Tensor::from_primitive(TensorPrimitive::Float(out))
+    }
 }
 
 /// Keep checkpointing at the same granularity as Python's Anima trainer.
@@ -344,7 +404,7 @@ where
     }
 }
 
-fn attention_query_chunk_size() -> usize {
+pub(crate) fn attention_query_chunk_size() -> usize {
     ATTENTION_CHUNK_SIZE.load(Ordering::Relaxed)
 }
 
@@ -726,6 +786,27 @@ pub trait AnimaAttentionLayer<B: Backend>: Module<B> + ModuleDisplay + core::fmt
         B: BlockCheckpointBackend,
     {
         block.forward_with_text_mask_and_spatial(input, text, condition, timestep_embedding, text_mask, spatial)
+    }
+
+    /// Forward a checkpoint segment. CUDA autodiff overrides this so several
+    /// adjacent DiT blocks share one local recomputation/backward graph.
+    fn forward_block_segment(
+        blocks: &[&AnimaDiTBlock<B, Self>], input: Tensor<B, 3>, text: Tensor<B, 3>,
+        condition: Tensor<B, 2>, timestep_embedding: Tensor<B, 2>, text_mask: Option<Tensor<B, 4>>,
+        spatial: Option<(usize, usize)>,
+    ) -> Tensor<B, 3>
+    where
+        Self: Sized,
+        B: BlockCheckpointBackend,
+    {
+        let mut hidden = input;
+        for block in blocks {
+            hidden = Self::forward_block(
+                block, hidden, text.clone(), condition.clone(), timestep_embedding.clone(),
+                text_mask.clone(), spatial,
+            );
+        }
+        hidden
     }
 
     fn init_self(
@@ -1194,8 +1275,34 @@ where
             .swap_dims(1, 2);
         if trace { eprintln!("[progress] phase=attention_v_projection_complete"); }
         if trace { eprintln!("[progress] phase=attention_qk_norm_begin"); }
-        let q = self.standard.q_norm.forward(q);
-        let k = self.standard.k_norm.forward(k);
+        let q = burn_autodiff::ops::rms_norm_manual::<Inner>(
+            match q.into_primitive() {
+                TensorPrimitive::Float(value) => value,
+                TensorPrimitive::QFloat(_) => panic!("quantized q norm input is unsupported"),
+            },
+            match self.standard.q_norm.gamma.val().detach().into_primitive() {
+                TensorPrimitive::Float(value) => value.primitive,
+                TensorPrimitive::QFloat(_) => panic!("quantized q norm gamma is unsupported"),
+            },
+            self.standard.q_norm.epsilon,
+        );
+        let q = Tensor::<burn_autodiff::Autodiff<Inner, C>, 4>::from_primitive(
+            TensorPrimitive::Float(q),
+        );
+        let k = burn_autodiff::ops::rms_norm_manual::<Inner>(
+            match k.into_primitive() {
+                TensorPrimitive::Float(value) => value,
+                TensorPrimitive::QFloat(_) => panic!("quantized k norm input is unsupported"),
+            },
+            match self.standard.k_norm.gamma.val().detach().into_primitive() {
+                TensorPrimitive::Float(value) => value.primitive,
+                TensorPrimitive::QFloat(_) => panic!("quantized k norm gamma is unsupported"),
+            },
+            self.standard.k_norm.epsilon,
+        );
+        let k = Tensor::<burn_autodiff::Autodiff<Inner, C>, 4>::from_primitive(
+            TensorPrimitive::Float(k),
+        );
         let dump_attention = std::env::var_os("AFTERBURNER_TRAIN_DUMP_DIR").is_some()
             && query_length >= 3000;
         let attention_dump_prefix = if dump_attention {
@@ -1253,7 +1360,7 @@ where
             TensorPrimitive::QFloat(_) => panic!("quantized attention masks are unsupported"),
         });
         if trace { eprintln!("[progress] phase=attention_fused_begin"); }
-        let attended = burn_autodiff::ops::fused_attention_with_mask_and_chunk::<Inner, C>(
+        let attended = burn_autodiff::ops::fused_attention_manual::<Inner>(
             match q.into_primitive() {
                 TensorPrimitive::Float(value) => value,
                 TensorPrimitive::QFloat(_) => panic!("quantized attention queries are unsupported"),
@@ -1320,6 +1427,21 @@ where
         block.forward_checkpointed(AnimaDiTBlockInputs {
             input, text, condition, timestep_embedding, text_mask, spatial,
         })
+    }
+
+    fn forward_block_segment(
+        blocks: &[&AnimaDiTBlock<burn_autodiff::Autodiff<Inner, C>, Self>],
+        input: Tensor<burn_autodiff::Autodiff<Inner, C>, 3>,
+        text: Tensor<burn_autodiff::Autodiff<Inner, C>, 3>,
+        condition: Tensor<burn_autodiff::Autodiff<Inner, C>, 2>,
+        timestep_embedding: Tensor<burn_autodiff::Autodiff<Inner, C>, 2>,
+        text_mask: Option<Tensor<burn_autodiff::Autodiff<Inner, C>, 4>>,
+        spatial: Option<(usize, usize)>,
+    ) -> Tensor<burn_autodiff::Autodiff<Inner, C>, 3> {
+        AnimaDiTBlock::forward_segment_checkpointed(
+            blocks,
+            AnimaDiTBlockInputs { input, text, condition, timestep_embedding, text_mask, spatial },
+        )
     }
 
     fn forward_lora_linear(
@@ -2490,16 +2612,30 @@ where
         if !compact_progress {
             eprintln!("[progress] phase=input_projection_complete");
         }
-        for (index, block) in self.blocks.iter().enumerate() {
+        let segment_size = std::env::var("AFTERBURNER_CHECKPOINT_SEGMENT_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(4)
+            .min(self.blocks.len().max(1));
+        if !compact_progress {
+            eprintln!("[checkpoint] segment_size={} segments={}", segment_size,
+                (self.blocks.len() + segment_size - 1) / segment_size);
+        }
+        let mut start = 0usize;
+        while start < self.blocks.len() {
+            let end = (start + segment_size).min(self.blocks.len());
+            let block_slice = self.blocks[start..end]
+                .iter()
+                .collect::<Vec<_>>();
             if !compact_progress {
                 eprintln!(
-                    "[progress] phase=dit_block_forward_begin block={}/{}",
-                    index + 1,
-                    self.blocks.len()
+                    "[progress] phase=dit_segment_forward_begin blocks={}-{}",
+                    start + 1, end
                 );
             }
-            hidden = A::forward_block(
-                block,
+            hidden = A::forward_block_segment(
+                &block_slice,
                 hidden,
                 text.clone(),
                 time_condition.clone(),
@@ -2507,23 +2643,23 @@ where
                 if conditioned { None } else { text_mask.clone() },
                 Some(spatial),
             );
-            if index == 0 || index == 1 || index == 27 {
+            if start == 0 || end == self.blocks.len() {
                 dump_forward_tensor(
                     forward_dump_step,
-                    &format!("rust_block_{index:02}"),
+                    &format!("rust_block_{:02}", end - 1),
                     &hidden,
                 );
             }
             if !compact_progress {
                 eprintln!(
-                    "[progress] phase=dit_block_forward_complete block={}/{}",
-                    index + 1,
-                    self.blocks.len()
+                    "[progress] phase=dit_segment_forward_complete blocks={}-{}",
+                    start + 1, end
                 );
             }
             if debug {
-                eprintln!("[forward] block {} complete: {:?}", index, hidden.dims());
+                eprintln!("[forward] segment {}..{} complete: {:?}", start, end, hidden.dims());
             }
+            start = end;
         }
         let final_fp32 = python_fp16_boundary(&hidden);
         let time_condition = if final_fp32 {

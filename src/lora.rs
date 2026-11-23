@@ -312,7 +312,7 @@ where
                 input, weight, down, up, scale,
             )
         } else {
-            burn_autodiff::ops::fused_lora_linear::<Inner, C>(input, weight, down, up, scale)
+            burn_autodiff::ops::fused_lora_linear_manual::<Inner, C>(input, weight, down, up, scale)
         };
         Tensor::from_primitive(TensorPrimitive::Float(output))
     }
