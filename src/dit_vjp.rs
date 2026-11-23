@@ -1105,7 +1105,7 @@ fn block_backward_inner<B: Backend>(
 /// block-entry activations, and runs a single reverse loop manual VJP during
 /// backward without constructing any local autodiff graph.
 pub fn forward_dit_blocks_manual_vjp<B, C>(
-    blocks: &[AnimaDiTBlock<Autodiff<B, C>, AnimaAttentionCuda<Autodiff<B, C>>>],
+    blocks: &[&AnimaDiTBlock<Autodiff<B, C>, AnimaAttentionCuda<Autodiff<B, C>>>],
     hidden: Tensor<Autodiff<B, C>, 3>,
     text: Tensor<Autodiff<B, C>, 3>,
     time_condition: Tensor<Autodiff<B, C>, 2>,
@@ -1377,8 +1377,9 @@ mod tests {
         let hidden_vjp =
             Tensor::<AdBackend, 3>::from_data(TensorData::new(hidden_data, [1, 4, 12]), &device)
                 .require_grad();
+        let block_refs = model.blocks.iter().collect::<Vec<_>>();
         let out_vjp = forward_dit_blocks_manual_vjp(
-            &model.blocks,
+            &block_refs,
             hidden_vjp.clone(),
             text,
             cond,
@@ -1422,10 +1423,25 @@ mod tests {
         let ref_params = GradientsParams::from_params(&mut grads_ref, &model, &ids);
         let vjp_params = GradientsParams::from_params(&mut grads_vjp, &model, &ids);
         for id in ids {
-            let g_ref = ref_params.get::<Inner, 2>(id).unwrap().into_data().to_vec::<f32>().unwrap();
-            let g_vjp = vjp_params.get::<Inner, 2>(id).unwrap().into_data().to_vec::<f32>().unwrap();
-            for (a, b) in g_ref.iter().zip(&g_vjp) {
-                assert!((a - b).abs() < 1e-4, "LoRA grad mismatch for {id:?}: {a} vs {b}");
+            let g_ref = ref_params
+                .get::<Inner, 2>(id)
+                .map(|tensor| tensor.into_data().to_vec::<f32>().unwrap());
+            let g_vjp = vjp_params
+                .get::<Inner, 2>(id)
+                .map(|tensor| tensor.into_data().to_vec::<f32>().unwrap());
+            match (g_ref, g_vjp) {
+                (Some(g_ref), Some(g_vjp)) => {
+                    for (a, b) in g_ref.iter().zip(&g_vjp) {
+                        assert!((a - b).abs() < 1e-4, "LoRA grad mismatch for {id:?}: {a} vs {b}");
+                    }
+                }
+                (Some(g_ref), None) => {
+                    assert!(g_ref.iter().all(|value| value.abs() < 1e-6), "VJP omitted non-zero LoRA grad for {id:?}");
+                }
+                (None, Some(g_vjp)) => {
+                    assert!(g_vjp.iter().all(|value| value.abs() < 1e-6), "reference omitted non-zero LoRA grad for {id:?}");
+                }
+                (None, None) => {}
             }
         }
     }

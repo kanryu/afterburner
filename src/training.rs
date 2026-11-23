@@ -18,7 +18,7 @@ use crate::{
     dit::{AnimaAttentionLayer, AnimaDiT, AnimaTensorError, BlockCheckpointBackend},
     logging::{NullLogger, TrainingLogger},
     lora::LoraConfig,
-    vae::VaeError,
+    vae::{VaeError, VaeTensor},
 };
 
 static TRAIN_DUMP_STEP: AtomicUsize = AtomicUsize::new(0);
@@ -96,6 +96,53 @@ fn dump_training_tensor<B: burn::tensor::backend::Backend, const D: usize>(
     if let Err(error) = std::fs::write(directory.join(format!("{safe_name}.json")), metadata) {
         eprintln!("[training-dump] {name} metadata write failed: {error}");
     }
+}
+
+fn dump_replay_input(step: usize, sigma: f32, noise: &VaeTensor, latent: &VaeTensor) {
+    let Some(directory) = std::env::var_os("AFTERBURNER_TRAIN_DUMP_DIR") else {
+        return;
+    };
+    let max_steps = std::env::var("AFTERBURNER_TRAIN_DUMP_STEPS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(3);
+    if step == 0 || step > max_steps {
+        return;
+    }
+    let directory = std::path::PathBuf::from(directory).join(format!("step-{step:06}"));
+    if let Err(error) = std::fs::create_dir_all(&directory) {
+        eprintln!("[training-dump] replay directory failed: {error}");
+        return;
+    }
+    let write_tensor = |name: &str, tensor: &VaeTensor| {
+        let mut bytes = Vec::with_capacity(tensor.data.len() * std::mem::size_of::<f32>());
+        for value in &tensor.data {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        if let Err(error) = std::fs::write(directory.join(format!("{name}.f32")), bytes) {
+            eprintln!("[training-dump] {name} replay write failed: {error}");
+        }
+        let shape = tensor
+            .shape
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        if let Err(error) = std::fs::write(
+            directory.join(format!("{name}.shape.json")),
+            format!("[{shape}]"),
+        ) {
+            eprintln!("[training-dump] {name} replay shape write failed: {error}");
+        }
+    };
+    if let Err(error) = std::fs::write(
+        directory.join("sigma.f32"),
+        sigma.to_le_bytes(),
+    ) {
+        eprintln!("[training-dump] sigma replay write failed: {error}");
+    }
+    write_tensor("noise", noise);
+    write_tensor("latent", latent);
 }
 
 fn load_gradient_replay<B, A>(
@@ -1260,6 +1307,9 @@ where
         } else {
             gaussian_like(&sample.image_latent.shape, &mut rng)?
         };
+        if let Some(sigma) = flow_sigma {
+            dump_replay_input(step + 1, sigma, &noise, &sample.image_latent);
+        }
         let example = if let Some(sigma) = flow_sigma {
             // Keep the shifted continuous sigma for both the noisy latent and
             // timestep embedding, matching kohya_ss's sigma sampling path.

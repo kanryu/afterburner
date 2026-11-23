@@ -83,14 +83,14 @@ pub fn lora_linear_backward<B: Backend>(
     let low = B::float_matmul(input.clone(), B::float_transpose(down));
     let d_up = B::float_cast(
         B::float_mul_scalar(
-            B::float_transpose(chunked_factor_gradient::<B>(low, grad.clone())),
+            B::float_transpose(chunked_factor_gradient_f32::<B>(low, grad.clone())),
             scale,
         ),
         up_dtype,
     );
     let d_down = B::float_cast(
         B::float_mul_scalar(
-            chunked_factor_gradient::<B>(B::float_matmul(grad, up), input),
+            chunked_factor_gradient_f32::<B>(B::float_matmul(grad, up), input),
             scale,
         ),
         down_dtype,
@@ -214,6 +214,34 @@ fn chunked_factor_gradient<B: Backend>(
             B::float_transpose(row_slice::<B>(left.clone(), start, end)),
             row_slice::<B>(right.clone(), start, end),
         );
+        accumulated = Some(match accumulated {
+            Some(value) => B::float_add(value, partial),
+            None => partial,
+        });
+    }
+    accumulated.expect("fused LoRA backward received an empty row dimension")
+}
+
+/// Accumulates a LoRA factor gradient in F32 without materializing full-size
+/// F32 activation copies. Only one row chunk is promoted at a time; the
+/// accumulator itself is the small rank-by-hidden/output factor.
+fn chunked_factor_gradient_f32<B: Backend>(
+    left: B::FloatTensorPrimitive,
+    right: B::FloatTensorPrimitive,
+) -> B::FloatTensorPrimitive {
+    let rows = left.shape()[0];
+    let mut accumulated = None;
+    for start in (0..rows).step_by(LORA_BACKWARD_ROW_CHUNK) {
+        let end = (start + LORA_BACKWARD_ROW_CHUNK).min(rows);
+        let left_chunk = B::float_cast(
+            row_slice::<B>(left.clone(), start, end),
+            FloatDType::F32,
+        );
+        let right_chunk = B::float_cast(
+            row_slice::<B>(right.clone(), start, end),
+            FloatDType::F32,
+        );
+        let partial = B::float_matmul(B::float_transpose(left_chunk), right_chunk);
         accumulated = Some(match accumulated {
             Some(value) => B::float_add(value, partial),
             None => partial,
@@ -378,7 +406,7 @@ impl<B: Backend> Backward<B, 4> for FusedLoraBackward {
         }
         if let Some(node) = ops.parents[3].as_ref() {
             let low = B::float_matmul(input_value.clone(), B::float_transpose(down_value));
-            let grad_up = B::float_transpose(chunked_factor_gradient::<B>(low, grad.clone()));
+            let grad_up = B::float_transpose(chunked_factor_gradient_f32::<B>(low, grad.clone()));
             grads.register::<B>(
                 node.id,
                 B::float_cast(B::float_mul_scalar(grad_up, scale), up_gradient_dtype),
@@ -386,7 +414,7 @@ impl<B: Backend> Backward<B, 4> for FusedLoraBackward {
         }
         if let Some(node) = ops.parents[2].as_ref() {
             let grad_low = B::float_matmul(grad.clone(), up_value);
-            let grad_down = chunked_factor_gradient::<B>(grad_low, input_value.clone());
+            let grad_down = chunked_factor_gradient_f32::<B>(grad_low, input_value.clone());
             grads.register::<B>(
                 node.id,
                 B::float_cast(B::float_mul_scalar(grad_down, scale), down_gradient_dtype),

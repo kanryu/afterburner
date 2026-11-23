@@ -183,11 +183,9 @@ impl LoraLinearConfig {
 }
 
 fn lora_parameter_dtype() -> DType {
-    if std::env::var_os("AFTERBURNER_LORA_BF16").is_some() {
-        DType::BF16
-    } else {
-        DType::F32
-    }
+    // LoRA factors are optimizer parameters, not activation workspaces.
+    // Keep them in F32 so small AdamW updates are not rounded away by BF16.
+    DType::F32
 }
 
 /// Burn-native Linear + LoRA adapter.
@@ -325,6 +323,9 @@ where
         &self,
         input: Tensor<burn_autodiff::Autodiff<Inner, C>, 3>,
     ) -> Tensor<burn_autodiff::Autodiff<Inner, C>, 3> {
+        if std::env::var_os("AFTERBURNER_DISABLE_MANUAL_VJP").is_some() {
+            return self.forward_sequence_chunked(input);
+        }
         let chunk = std::env::var("AFTERBURNER_LINEAR_CHUNK")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -355,6 +356,9 @@ where
         &self,
         input: Tensor<burn_autodiff::Autodiff<Inner, C>, 3>,
     ) -> Tensor<burn_autodiff::Autodiff<Inner, C>, 3> {
+        if std::env::var_os("AFTERBURNER_DISABLE_MANUAL_VJP").is_some() {
+            return self.forward_sequence_chunked(input);
+        }
         let chunk = std::env::var("AFTERBURNER_LINEAR_CHUNK")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -388,6 +392,9 @@ where
         &self,
         input: Tensor<burn_autodiff::Autodiff<Inner, C>, D>,
     ) -> Tensor<burn_autodiff::Autodiff<Inner, C>, D> {
+        if std::env::var_os("AFTERBURNER_DISABLE_MANUAL_VJP").is_some() {
+            return self.forward_low_precision(input);
+        }
         // Preserve the AutodiffTensor nodes. Calling `.tensor()` here unwraps
         // the inner backend primitive and silently cuts the graph before the
         // fused operation can register its parents.
@@ -415,6 +422,9 @@ where
         &self,
         input: Tensor<burn_autodiff::Autodiff<Inner, C>, D>,
     ) -> Tensor<burn_autodiff::Autodiff<Inner, C>, D> {
+        if std::env::var_os("AFTERBURNER_DISABLE_MANUAL_VJP").is_some() {
+            return self.forward_low_precision(input);
+        }
         let input_dtype = input.dtype();
         let (weight, down, up) = self.cast_fused_operands(input_dtype);
         Self::forward_fused_operands(

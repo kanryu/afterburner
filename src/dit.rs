@@ -25,6 +25,24 @@ use crate::{
     lora::{LoraConfig, LoraLinear, LoraLinearConfig},
 };
 
+fn layer_norm_last_dim_f32<B: Backend>(
+    input: Tensor<B, 3>,
+    scale: Tensor<B, 2>,
+    shift: Tensor<B, 2>,
+    hidden_size: usize,
+) -> Tensor<B, 3> {
+    let input_dtype = input.dtype();
+    let hidden_f32 = hidden_size as f32;
+    let input_f32 = input.cast(FloatDType::F32);
+    let mean = input_f32.clone().sum_dim(2).div_scalar(hidden_f32);
+    let diff = input_f32.sub(mean);
+    let variance = diff.clone().square().sum_dim(2).div_scalar(hidden_f32);
+    diff.div(variance.add_scalar(1e-6).sqrt())
+        .mul(scale.cast(FloatDType::F32).add_scalar(1.0).unsqueeze())
+        .add(shift.cast(FloatDType::F32).unsqueeze())
+        .cast(input_dtype)
+}
+
 /// Upper bound for the query dimension of one attention score matrix.
 ///
 /// With checkpointing enabled, the per-chunk operations can be recomputed
@@ -649,12 +667,7 @@ impl<B: Backend> AnimaFinalModulation<B> {
             .add(timestep_embedding.slice([0..batch, 0..self.hidden_size * 2]));
         let shift = params.clone().slice([0..batch, 0..self.hidden_size]);
         let scale = params.slice([0..batch, self.hidden_size..self.hidden_size * 2]);
-        let (variance, mean) = input.clone().var_mean_bias(2);
-        input
-            .sub(mean)
-            .div(variance.add_scalar(1e-6).sqrt())
-            .mul(scale.add_scalar(1.0).unsqueeze())
-            .add(shift.unsqueeze())
+        layer_norm_last_dim_f32(input, scale, shift, self.hidden_size)
     }
 }
 
@@ -714,14 +727,10 @@ impl<B: Backend> AdaLnModulation<B> {
             .clone()
             .slice([0..batch, self.hidden_size..self.hidden_size * 2]);
         let gate = params.slice([0..batch, self.hidden_size * 2..self.hidden_size * 3]);
-        let (variance, mean) = input.clone().var_mean_bias(2);
-        let normalized = input
-            .sub(mean)
-            // Python Cosmos/Anima uses LayerNorm(eps=1e-6) for every
-            // block AdaLN normalization.
-            .div(variance.add_scalar(1e-6).sqrt())
-            .mul(scale.add_scalar(1.0).unsqueeze())
-            .add(shift.unsqueeze());
+        // Python Cosmos/Anima uses LayerNorm(eps=1e-6) for every block
+        // AdaLN normalization. Compute the statistics in F32 because the
+        // CUDA mean/variance path is inaccurate for the BF16 residual stream.
+        let normalized = layer_norm_last_dim_f32(input, scale, shift, self.hidden_size);
         (normalized, gate.unsqueeze())
     }
 }
@@ -807,6 +816,22 @@ pub trait AnimaAttentionLayer<B: Backend>: Module<B> + ModuleDisplay + core::fmt
             );
         }
         hidden
+    }
+
+    /// Forward the whole DiT stack through the backend's fastest path.
+    /// CUDA overrides this with the single manual-VJP stack implementation.
+    fn forward_blocks_fast(
+        blocks: &[&AnimaDiTBlock<B, Self>], input: Tensor<B, 3>, text: Tensor<B, 3>,
+        condition: Tensor<B, 2>, timestep_embedding: Tensor<B, 2>, text_mask: Option<Tensor<B, 4>>,
+        spatial: Option<(usize, usize)>,
+    ) -> Tensor<B, 3>
+    where
+        Self: Sized,
+        B: BlockCheckpointBackend,
+    {
+        Self::forward_block_segment(
+            blocks, input, text, condition, timestep_embedding, text_mask, spatial,
+        )
     }
 
     fn init_self(
@@ -1441,6 +1466,31 @@ where
         AnimaDiTBlock::forward_segment_checkpointed(
             blocks,
             AnimaDiTBlockInputs { input, text, condition, timestep_embedding, text_mask, spatial },
+        )
+    }
+
+    fn forward_blocks_fast(
+        blocks: &[&AnimaDiTBlock<burn_autodiff::Autodiff<Inner, C>, Self>],
+        input: Tensor<burn_autodiff::Autodiff<Inner, C>, 3>,
+        text: Tensor<burn_autodiff::Autodiff<Inner, C>, 3>,
+        condition: Tensor<burn_autodiff::Autodiff<Inner, C>, 2>,
+        timestep_embedding: Tensor<burn_autodiff::Autodiff<Inner, C>, 2>,
+        text_mask: Option<Tensor<burn_autodiff::Autodiff<Inner, C>, 4>>,
+        spatial: Option<(usize, usize)>,
+    ) -> Tensor<burn_autodiff::Autodiff<Inner, C>, 3> {
+        if std::env::var_os("AFTERBURNER_DISABLE_MANUAL_VJP").is_some() {
+            return Self::forward_block_segment(
+                blocks, input, text, condition, timestep_embedding, text_mask, spatial,
+            );
+        }
+        crate::dit_vjp::forward_dit_blocks_manual_vjp(
+            blocks,
+            input,
+            text,
+            condition,
+            timestep_embedding,
+            text_mask,
+            spatial.expect("CUDA manual VJP requires image spatial dimensions"),
         )
     }
 
@@ -2623,6 +2673,19 @@ where
                 (self.blocks.len() + segment_size - 1) / segment_size);
         }
         let mut start = 0usize;
+        if std::env::var_os("AFTERBURNER_DISABLE_MANUAL_VJP").is_none() {
+            let block_refs = self.blocks.iter().collect::<Vec<_>>();
+            hidden = A::forward_blocks_fast(
+                &block_refs,
+                hidden,
+                text.clone(),
+                time_condition.clone(),
+                timestep_embedding.clone(),
+                if conditioned { None } else { text_mask.clone() },
+                Some(spatial),
+            );
+            start = self.blocks.len();
+        }
         while start < self.blocks.len() {
             let end = (start + segment_size).min(self.blocks.len());
             let block_slice = self.blocks[start..end]
