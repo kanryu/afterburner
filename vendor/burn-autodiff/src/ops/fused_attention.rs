@@ -88,7 +88,12 @@ fn softmax<B: Backend>(
     let max = B::float_max_dim(scores.clone(), 3);
     let max = B::float_expand(max, score_shape.clone());
     let weights = B::float_exp(B::float_sub(scores, max));
-    let denominator = B::float_sum_dim(weights.clone(), 3);
+    // Keep the large score/activation tensors in the selected activation
+    // dtype, but accumulate the softmax normalization in F32. This avoids
+    // BF16 cancellation on long sequences without retaining an F32 copy of
+    // Q/K/V for the whole attention call.
+    let weights_f32 = B::float_cast(weights, FloatDType::F32);
+    let denominator = B::float_sum_dim(weights_f32.clone(), 3);
     let denominator = B::float_expand(denominator, [
         score_shape[0], score_shape[1], score_shape[2], 1,
     ].into());
@@ -96,7 +101,10 @@ fn softmax<B: Backend>(
     // implementation normalized only the output and returned the raw exp
     // scores to backward.  That made dV/dQ/dK grow with sequence length and
     // eventually overflow BF16 in the early DiT blocks.
-    let weights = B::float_div(weights, denominator);
+    let weights = B::float_cast(
+        B::float_div(weights_f32, denominator),
+        attention_dtype.into(),
+    );
     let output = B::float_matmul(weights.clone(), value);
     (output, weights)
 }
@@ -188,13 +196,15 @@ pub fn attention_backward<B: Backend>(
             scale,
         );
         d_queries.push(dq);
+        let dk_f32 = B::float_cast(dk, FloatDType::F32);
+        let dv_f32 = B::float_cast(dv, FloatDType::F32);
         d_key = Some(match d_key {
-            Some(value) => B::float_add(value, dk),
-            None => dk,
+            Some(value) => B::float_add(value, dk_f32),
+            None => dk_f32,
         });
         d_value = Some(match d_value {
-            Some(value) => B::float_add(value, dv),
-            None => dv,
+            Some(value) => B::float_add(value, dv_f32),
+            None => dv_f32,
         });
     }
     (
