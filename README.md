@@ -1,5 +1,33 @@
 # Afterburner
 
+Afterburner is a complete image-generation AI training engine written in
+pure Rust. It is designed as a first-of-its-kind Rust-native training system
+for modern diffusion models, with a focus on practical GPU execution,
+memory efficiency, and deployable LoRA export.
+
+Afterburner uses the Burn engine for GPU programming and neural-network
+execution, and Candle for loading and preprocessing model data in the
+Safetensors format. It currently provides LoRA training for the Anima image
+generation engine. In real-world CUDA training, the complete workflow is
+designed to operate within approximately 12--13 GB of VRAM, depending on
+resolution, attention chunking, and backend configuration.
+
+## Why Afterburner uses a two-pass training pipeline
+
+Afterburner separates training into two passes:
+
+1. Create a training-data cache by running the text encoders and VAE.
+2. Train the DiT and export the learned LoRA adapter from the cache.
+
+Modern image-generation systems are commonly composed of three cooperating
+models: a diffusion transformer (DiT), one or more text encoders, and a VAE.
+The text encoders and VAE are required to create the training inputs, but they
+are not needed for the repeated optimizer updates once those inputs have been
+cached. During training, Afterburner therefore keeps the DiT and cached
+training tensors on the GPU while avoiding repeated text-encoder and VAE
+execution. This reduces VRAM pressure and removes unnecessary work from the
+main training loop.
+
 Afterburner is a Rust-based AI execution engine and command-line toolkit for
 training and exporting LoRA adapters for image-generation models. It uses Burn
 for diffusion-transformer training and Candle for text-encoder and VAE
