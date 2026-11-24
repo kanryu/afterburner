@@ -9,8 +9,9 @@ Afterburner uses the Burn engine for GPU programming and neural-network
 execution, and Candle for loading and preprocessing model data in the
 Safetensors format. It currently provides LoRA training for the Anima image
 generation engine. In real-world CUDA training, the complete workflow is
-designed to operate within approximately 12--13 GB of VRAM, depending on
-resolution, attention chunking, and backend configuration.
+designed for 16 GB-class consumer GPUs. Typical VRAM usage is approximately
+12--15 GB depending on resolution, attention chunking, whether `llm_adapter`
+training is enabled, and backend configuration.
 
 ## Why Afterburner uses a two-pass training pipeline
 
@@ -142,6 +143,18 @@ or rewritten just to match the LoRA dtype.
 The CLI default is `lora_rank=8` and `lora_alpha=16`, matching the practical
 Anima training baseline. Use `--lora-rank` explicitly for larger adapters.
 
+By default, Afterburner trains the LoRA factors in the DiT blocks. Use
+`--lora-llm-adapter` to additionally train the 6-block `llm_adapter`, which
+adds 120 LoRA factor tensors to the default 560 DiT factors, for a total of
+680 factor tensors. The manual VJP path propagates gradients from the
+cross-attention K/V projections back through the cached text representation
+so that `llm_adapter` factors are updated as well.
+
+The global gradient clipping threshold is controlled by `--max-grad-norm`.
+The default is `1.0`, matching the practical Anima baseline. Set it to `0`
+to disable clipping for an experiment; non-positive values skip the clipping
+operation. The selected value is printed in the training log.
+
 For training with long spatial sequences, enable Burn's balanced checkpointing
 strategy in addition to CUDA. Memory-bound operations are then eligible for
 forward recomputation during backward, reducing activation retention at the
@@ -158,7 +171,11 @@ Afterburner now uses a narrowly scoped local `burn-autodiff` fork. Its float
 MatMul operation is marked memory-bound and receives a retro-forward, allowing
 Burn's balanced checkpointing strategy to recompute MatMul inputs during
 backward. This reduces retained MatMul intermediates without detaching the
-gradient path. Full DiT-block checkpointing remains a separate follow-up.
+gradient path. In addition, CUDA Anima training uses a 28-block manual VJP
+path that retains block-entry activations and performs the reverse pass in a
+single block loop. This reduces local autodiff graph reconstruction and keeps
+the residual-gradient accumulation in the intended precision. Full
+backend-native block checkpoint primitives remain a separate follow-up.
 
 ```powershell
 cargo run -p afterburner-cli --features cuda,checkpointing -- `
@@ -223,6 +240,7 @@ optional):
   "seed": 42,
   "lora_rank": 8,
   "lora_alpha": 16,
+  "lora_llm_adapter": false,
   "attention_chunk": 256,
   "flow_matching": true,
   "device": "cuda",
