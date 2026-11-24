@@ -788,8 +788,12 @@ fn block_backward_inner<B: Backend>(
     activation_dtype: FloatDType,
     attention_chunk: usize,
     need_prev_dx: bool,
+    need_text_dx: bool,
     grads: &mut Gradients,
-) -> Option<B::FloatTensorPrimitive> {
+) -> (
+    Option<B::FloatTensorPrimitive>,
+    Option<B::FloatTensorPrimitive>,
+) {
     let shape = d_output_f32.shape();
     let [batch, seq, hidden_size] = [shape[0], shape[1], shape[2]];
     let heads = block.self_attn.head_count;
@@ -842,7 +846,7 @@ fn block_backward_inner<B: Backend>(
     };
 
     // --- 2. Cross-Attention VJP (and drop Cross-Attention cache immediately after) ---
-    let d_after_self_f32 = {
+    let (d_after_self_f32, d_text_block_f32) = {
         let d_cross_out_act = B::float_cast(
             B::float_mul(
                 d_after_cross_f32.clone(),
@@ -921,15 +925,19 @@ fn block_backward_inner<B: Backend>(
             B::float_swap_dims(d_k_cross_pre, 1, 2),
             Shape::from([batch, text_len, hidden_size]),
         );
-        let cross_k_grads = lora_linear_backward::<B>(
+        let mut cross_k_grads = lora_linear_backward::<B>(
             d_k_cross_2d,
             text_act.clone(),
             block.cross_attn.k_proj.weight.clone(),
             block.cross_attn.k_proj.down.clone(),
             block.cross_attn.k_proj.up.clone(),
             block.cross_attn.k_proj.scale,
-            false,
+            need_text_dx,
         );
+        let d_text_k_f32 = cross_k_grads
+            .d_input
+            .take()
+            .map(|value| B::float_cast(value, FloatDType::F32));
         register_lora_grads(
             &block.cross_attn.k_proj,
             cross_k_grads.d_down,
@@ -941,15 +949,19 @@ fn block_backward_inner<B: Backend>(
             B::float_swap_dims(d_v_cross, 1, 2),
             Shape::from([batch, text_len, hidden_size]),
         );
-        let cross_v_grads = lora_linear_backward::<B>(
+        let mut cross_v_grads = lora_linear_backward::<B>(
             d_v_cross_2d,
             text_act,
             block.cross_attn.v_proj.weight.clone(),
             block.cross_attn.v_proj.down.clone(),
             block.cross_attn.v_proj.up.clone(),
             block.cross_attn.v_proj.scale,
-            false,
+            need_text_dx,
         );
+        let d_text_v_f32 = cross_v_grads
+            .d_input
+            .take()
+            .map(|value| B::float_cast(value, FloatDType::F32));
         register_lora_grads(
             &block.cross_attn.v_proj,
             cross_v_grads.d_down,
@@ -957,11 +969,18 @@ fn block_backward_inner<B: Backend>(
             grads,
         );
 
-        adaln_input_backward_f32::<B>(
+        let d_text_block_f32 = match (d_text_k_f32, d_text_v_f32) {
+            (Some(d_k), Some(d_v)) => Some(B::float_add(d_k, d_v)),
+            (Some(d_k), None) => Some(d_k),
+            (None, Some(d_v)) => Some(d_v),
+            (None, None) => None,
+        };
+        let d_after_self_f32 = adaln_input_backward_f32::<B>(
             d_after_cross_f32,
             cross_q_grads.d_input.unwrap(),
             &cross_cache.cross_mod,
-        )
+        );
+        (d_after_self_f32, d_text_block_f32)
     };
 
     // --- 3. Self-Attention VJP ---
@@ -1087,18 +1106,21 @@ fn block_backward_inner<B: Backend>(
     );
 
     if !need_prev_dx {
-        return None;
+        return (None, d_text_block_f32);
     }
 
     let d_self_in = B::float_add(
         B::float_add(self_q_grads.d_input.unwrap(), self_k_grads.d_input.unwrap()),
         self_v_grads.d_input.unwrap(),
     );
-    Some(adaln_input_backward_f32::<B>(
-        d_after_self_f32,
-        d_self_in,
-        &self_cache.self_mod,
-    ))
+    (
+        Some(adaln_input_backward_f32::<B>(
+            d_after_self_f32,
+            d_self_in,
+            &self_cache.self_mod,
+        )),
+        d_text_block_f32,
+    )
 }
 
 /// Executes all DiT blocks on `InnerBackend` during forward, retaining only
@@ -1129,7 +1151,8 @@ where
     };
 
     let (hidden_raw, hidden_node) = extract_tensor_inner(hidden);
-    let (text_raw, _) = extract_tensor_inner(text);
+    let text_dtype: FloatDType = text.dtype().into();
+    let (text_raw, text_node) = extract_tensor_inner(text);
     let (cond_raw, _) = extract_tensor_inner(time_condition);
     let (t_emb_raw, _) = extract_tensor_inner(timestep_embedding);
     let mask_raw = text_mask.map(|mask| extract_tensor_inner(mask).0);
@@ -1169,10 +1192,14 @@ where
 
     let mut block_weights = Vec::with_capacity(blocks.len());
     let mut block_inputs = Vec::with_capacity(blocks.len());
-    let mut parent_nodes = Vec::with_capacity(blocks.len() * 20 + 1);
+    let mut parent_nodes = Vec::with_capacity(blocks.len() * 20 + 2);
     let input_requires_grad = !hidden_node.requirement.is_none();
     if input_requires_grad {
         parent_nodes.push(hidden_node.clone());
+    }
+    let text_requires_grad = !text_node.requirement.is_none();
+    if text_requires_grad {
+        parent_nodes.push(text_node.clone());
     }
 
     for block in blocks {
@@ -1211,12 +1238,15 @@ where
     }
 
     let input_node_id: Option<NodeId> = input_requires_grad.then_some(hidden_node.id);
+    let text_node_id: Option<NodeId> = text_requires_grad.then_some(text_node.id);
     let backward_fn = Box::new(
         move |grad_output: B::FloatTensorPrimitive, grads: &mut Gradients| {
             // Keep residual stream gradient in F32 across all 28 blocks.
             let mut d_hidden_f32 = B::float_cast(grad_output, FloatDType::F32);
+            let mut d_text_f32 = None;
             for block_idx in (0..block_weights.len()).rev() {
                 let need_prev_dx = block_idx > 0 || input_node_id.is_some();
+                let need_text_dx = text_node_id.is_some();
                 let w = &block_weights[block_idx];
                 let h_in = block_inputs[block_idx].clone();
                 let (_, cache) = block_forward_inner::<B>(
@@ -1233,7 +1263,7 @@ where
                     true,
                 );
                 let cache = cache.expect("block recompute cache must be produced");
-                if let Some(prev_d_hidden_f32) = block_backward_inner::<B>(
+                let (prev_d_hidden_f32, d_text_block_f32) = block_backward_inner::<B>(
                     w,
                     cache,
                     d_hidden_f32.clone(),
@@ -1243,14 +1273,25 @@ where
                     activation_dtype,
                     attention_chunk,
                     need_prev_dx,
+                    need_text_dx,
                     grads,
-                ) {
+                );
+                if let Some(prev_d_hidden_f32) = prev_d_hidden_f32 {
                     d_hidden_f32 = prev_d_hidden_f32;
+                }
+                if let Some(d_text_block_f32) = d_text_block_f32 {
+                    d_text_f32 = Some(match d_text_f32 {
+                        Some(acc) => B::float_add(acc, d_text_block_f32),
+                        None => d_text_block_f32,
+                    });
                 }
             }
             if let Some(in_id) = input_node_id {
                 let dx_final = B::float_cast(d_hidden_f32, activation_dtype);
                 grads.register::<B>(in_id, dx_final);
+            }
+            if let (Some(text_id), Some(d_text_f32)) = (text_node_id, d_text_f32) {
+                grads.register::<B>(text_id, B::float_cast(d_text_f32, text_dtype));
             }
         },
     );
@@ -1354,7 +1395,11 @@ mod tests {
         let hidden_ref =
             Tensor::<AdBackend, 3>::from_data(TensorData::new(hidden_data.clone(), [1, 4, 12]), &device)
                 .require_grad();
-        let text = Tensor::<AdBackend, 3>::from_data(TensorData::new(text_data, [1, 3, 12]), &device);
+        let text_ref = Tensor::<AdBackend, 3>::from_data(
+            TensorData::new(text_data.clone(), [1, 3, 12]),
+            &device,
+        )
+        .require_grad();
         let cond = Tensor::<AdBackend, 2>::from_data(TensorData::new(cond_data, [1, 12]), &device);
         let temb = Tensor::<AdBackend, 2>::from_data(TensorData::new(temb_data, [1, 36]), &device);
         let weights =
@@ -1364,7 +1409,7 @@ mod tests {
         for block in &model.blocks {
             out_ref = block.forward_with_text_mask_and_spatial(
                 out_ref,
-                text.clone(),
+                text_ref.clone(),
                 cond.clone(),
                 temb.clone(),
                 None,
@@ -1377,11 +1422,16 @@ mod tests {
         let hidden_vjp =
             Tensor::<AdBackend, 3>::from_data(TensorData::new(hidden_data, [1, 4, 12]), &device)
                 .require_grad();
+        let text_vjp = Tensor::<AdBackend, 3>::from_data(
+            TensorData::new(text_data, [1, 3, 12]),
+            &device,
+        )
+        .require_grad();
         let block_refs = model.blocks.iter().collect::<Vec<_>>();
         let out_vjp = forward_dit_blocks_manual_vjp(
             &block_refs,
             hidden_vjp.clone(),
-            text,
+            text_vjp.clone(),
             cond,
             temb,
             None,
@@ -1400,6 +1450,22 @@ mod tests {
         let dx_vjp = hidden_vjp.grad(&grads_vjp).unwrap().into_data().to_vec::<f32>().unwrap();
         for (a, b) in dx_ref.iter().zip(&dx_vjp) {
             assert!((a - b).abs() < 1e-4, "dx mismatch: {a} vs {b}");
+        }
+
+        let dtext_ref = text_ref
+            .grad(&grads_ref)
+            .expect("reference text gradient")
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let dtext_vjp = text_vjp
+            .grad(&grads_vjp)
+            .expect("VJP text gradient")
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        for (a, b) in dtext_ref.iter().zip(&dtext_vjp) {
+            assert!((a - b).abs() < 1e-4, "dtext mismatch: {a} vs {b}");
         }
 
         let mut ids = Vec::new();

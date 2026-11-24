@@ -895,6 +895,7 @@ struct LoraCollector<B: Backend> {
     tensors: Vec<(String, OwnedTensorView)>,
     error: Option<String>,
     target_modules: Vec<String>,
+    include_llm_adapter: bool,
     alpha: f32,
     output_dtype: LoraOutputDtype,
     path: Vec<String>,
@@ -907,6 +908,7 @@ impl<B: Backend> LoraCollector<B> {
             tensors: Vec::new(),
             error: None,
             target_modules: lora.target_modules.clone(),
+            include_llm_adapter: lora.include_llm_adapter,
             alpha: lora.alpha as f32,
             output_dtype,
             path: Vec::new(),
@@ -935,16 +937,24 @@ impl<B: Backend> ModuleVisitor<B> for LoraCollector<B> {
         if name != "lora_down" && name != "lora_up" {
             return;
         }
-        if path.len() < 3 || path[0] != "blocks" {
+        let (start, key_prefix) = if path.first().map(String::as_str) == Some("blocks") {
+            (2, "blocks")
+        } else if self.include_llm_adapter
+            && path.len() >= 4
+            && path[0] == "llm_adapter"
+            && path[1] == "blocks"
+        {
+            (3, "llm_adapter.blocks")
+        } else {
             return;
-        }
+        };
         // The CUDA attention implementation wraps the portable attention
         // module in an additional `standard` field.  That implementation
         // detail must not change the logical LoRA target name used by
         // kohya_ss/ComfyUI.  Normalize both the portable path
         // (`blocks.0.self_attn.q_proj`) and the CUDA path
         // (`blocks.0.self_attn.standard.q_proj`) to the same target.
-        let logical_path = path[2..path.len() - 1]
+        let logical_path = path[start..path.len() - 1]
             .iter()
             .filter(|component| component.as_str() != "standard")
             .cloned()
@@ -968,7 +978,8 @@ impl<B: Backend> ModuleVisitor<B> for LoraCollector<B> {
         // Match kohya_ss/networks.lora_anima, which is the native Anima LoRA
         // format recognized by ComfyUI. Dots in the target path are flattened
         // to underscores under the lora_unet_ prefix.
-        let target_key = format!("{}.{}.{}", path[0], path[1], module).replace('.', "_");
+        let target_key = format!("{}.{}.{}", key_prefix, path[start - 1], module)
+            .replace('.', "_");
         let key_base = format!("lora_unet_{target_key}");
         let key = format!("{key_base}.{name}.weight");
         if name == "lora_down" {

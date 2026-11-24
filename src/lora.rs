@@ -15,12 +15,16 @@ pub enum LoraTargetKind {
     Linear,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LoraConfig {
     pub rank: usize,
     pub alpha: usize,
     pub target_modules: Vec<String>,
     pub train_bias: bool,
+    /// Enable LoRA factors under `llm_adapter.blocks.*`.
+    pub include_llm_adapter: bool,
+    /// Global gradient-norm clipping threshold; non-positive disables clipping.
+    pub max_grad_norm: f32,
 }
 
 impl Default for LoraConfig {
@@ -34,6 +38,8 @@ impl Default for LoraConfig {
                 .map(str::to_owned)
                 .collect(),
             train_bias: false,
+            include_llm_adapter: false,
+            max_grad_norm: 1.0,
         }
     }
 }
@@ -458,12 +464,18 @@ pub fn select_anima_target(
     let Some(key) = normalize_anima_lora_key(key) else {
         return Ok(None);
     };
-    if !key.starts_with("blocks.") || key.contains("llm_adapter") {
+    let (module_path, is_llm_adapter) = if let Some(rest) = key.strip_prefix("blocks.") {
+        (rest, false)
+    } else if let Some(rest) = key.strip_prefix("llm_adapter.blocks.") {
+        (rest, true)
+    } else {
+        return Ok(None);
+    };
+    if is_llm_adapter && !config.include_llm_adapter {
         return Ok(None);
     }
-    let module = key
-        .strip_prefix("blocks.")
-        .and_then(|value| value.split_once('.'))
+    let module = module_path
+        .split_once('.')
         .map(|(_, value)| value);
     let Some(module) = module else {
         return Ok(None);
@@ -595,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn excludes_llm_adapter_from_dit_targets() {
+    fn excludes_llm_adapter_unless_enabled() {
         let target = select_anima_target(
             "model.diffusion_model.llm_adapter.blocks.0.self_attn.q_proj.weight",
             &[1024, 1024],
@@ -603,6 +615,16 @@ mod tests {
         )
         .unwrap();
         assert!(target.is_none());
+
+        let mut config = LoraConfig::default();
+        config.include_llm_adapter = true;
+        let target = select_anima_target(
+            "model.diffusion_model.llm_adapter.blocks.0.self_attn.q_proj.weight",
+            &[1024, 1024],
+            &config,
+        )
+        .unwrap();
+        assert!(target.is_some());
     }
 
     #[test]

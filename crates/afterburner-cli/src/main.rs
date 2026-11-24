@@ -271,6 +271,7 @@ struct TrainingConfig {
     seed: Option<u64>,
     lora_rank: Option<usize>,
     lora_alpha: Option<usize>,
+    lora_llm_adapter: Option<bool>,
     flow_matching: Option<bool>,
     flow_shift: Option<f32>,
     #[serde(alias = "anima_timestep_sampling")]
@@ -566,6 +567,7 @@ fn run() {
     // size and optimizer state within the intended 16 GiB class.
     let mut lora_rank = 8usize;
     let mut lora_alpha = 16usize;
+    let mut lora_llm_adapter = false;
     let mut optimizer_kind = OptimizerKind::AdamW;
     #[cfg(feature = "bf16")]
     let mut lora_dtype = "bf16".to_owned();
@@ -600,6 +602,7 @@ fn run() {
     let mut explicit_seed = false;
     let mut explicit_lora_rank = false;
     let mut explicit_lora_alpha = false;
+    let mut explicit_lora_llm_adapter = false;
     let mut explicit_flow_matching = false;
     let mut explicit_flow_shift = false;
     let mut explicit_timestep_sampling = false;
@@ -736,6 +739,9 @@ fn run() {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(16);
             explicit_lora_alpha = true;
+        } else if argument == "--lora-llm-adapter" {
+            lora_llm_adapter = true;
+            explicit_lora_llm_adapter = true;
         } else if argument == "--lora-dtype" {
             if let Some(value) = args.next() {
                 lora_dtype = value;
@@ -922,6 +928,11 @@ fn run() {
         if !explicit_lora_alpha {
             if let Some(value) = config.lora_alpha {
                 lora_alpha = value;
+            }
+        }
+        if !explicit_lora_llm_adapter {
+            if let Some(value) = config.lora_llm_adapter {
+                lora_llm_adapter = value;
             }
         }
         if !explicit_flow_matching {
@@ -1383,6 +1394,8 @@ fn run() {
         let mut lora = afterburner::LoraConfig::default();
         lora.rank = lora_rank;
         lora.alpha = lora_alpha;
+        lora.include_llm_adapter = lora_llm_adapter;
+        lora.max_grad_norm = max_grad_norm;
         lora.validate().expect("invalid LoRA configuration");
         let output_dtype = match lora_dtype.as_str() {
             "f32" | "float32" => afterburner::LoraOutputDtype::F32,
@@ -1926,6 +1939,8 @@ fn run() {
             }
         );
         println!("output_dtype={lora_dtype}");
+        println!("lora_llm_adapter={lora_llm_adapter}");
+        println!("max_grad_norm={max_grad_norm}");
         println!("last_loss={:?}", report.last_loss);
         println!("lora_factor_tensors={factor_count}");
         println!("lora_path={output_lora}");

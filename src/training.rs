@@ -164,6 +164,7 @@ where
     };
     let mut collector = LoraGradientCollector {
         target_modules: lora.target_modules.clone(),
+        include_llm_adapter: lora.include_llm_adapter,
         path: Vec::new(),
         parameters: Vec::new(),
     };
@@ -552,7 +553,11 @@ where
         } else {
             raw_gradients
         };
-        let gradients = gradients.clip_by_global_norm::<B::InnerBackend>(1.0);
+        let gradients = if lora.max_grad_norm > 0.0 {
+            gradients.clip_by_global_norm::<B::InnerBackend>(lora.max_grad_norm)
+        } else {
+            gradients
+        };
         if std::env::var_os("AFTERBURNER_DEBUG_LORA_GRADIENT").is_some() {
             for block_index in [0_usize, 13, 26] {
                 let id = model.blocks[block_index]
@@ -666,6 +671,7 @@ where
 
 struct LoraIdCollector {
     target_modules: Vec<String>,
+    include_llm_adapter: bool,
     ids: Vec<ParamId>,
     path: Vec<String>,
 }
@@ -676,16 +682,27 @@ struct LoraIdCollector {
 /// implementation under a `standard` field.  The LoRA configuration is
 /// intentionally backend-independent (`self_attn.q_proj`, etc.), so that
 /// implementation detail must not participate in target matching.
-fn lora_module_name(path: &[String]) -> Option<String> {
+fn lora_module_name(path: &[String], include_llm_adapter: bool) -> Option<String> {
     let factor = path.last()?;
     if factor != "lora_down" && factor != "lora_up" {
         return None;
     }
-    if path.len() < 3 || path[0] != "blocks" {
+    let start = if path.first().map(String::as_str) == Some("blocks") {
+        2
+    } else if include_llm_adapter
+        && path.len() >= 4
+        && path[0] == "llm_adapter"
+        && path[1] == "blocks"
+    {
+        3
+    } else {
+        return None;
+    };
+    if path.len() <= start + 1 {
         return None;
     }
 
-    let mut segments: Vec<&str> = path[2..path.len() - 1]
+    let mut segments: Vec<&str> = path[start..path.len() - 1]
         .iter()
         .map(String::as_str)
         .filter(|segment| *segment != "standard")
@@ -711,7 +728,7 @@ impl<B: burn::tensor::backend::Backend> ModuleVisitor<B> for LoraIdCollector {
 
     fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
         let path = &self.path;
-        if let Some(module) = lora_module_name(path) {
+        if let Some(module) = lora_module_name(path, self.include_llm_adapter) {
             if !self.target_modules.iter().any(|target| target == &module) {
                 return;
             }
@@ -729,7 +746,7 @@ impl<B: burn::tensor::backend::Backend> ModuleVisitor<B> for LoraIdCollector {
         id: ParamId,
         _tensor: &Tensor<B, D>,
     ) {
-        if let Some(module) = lora_module_name(path) {
+        if let Some(module) = lora_module_name(path, self.include_llm_adapter) {
             if !self.target_modules.iter().any(|target| target == &module) {
                 return;
             }
@@ -740,7 +757,7 @@ impl<B: burn::tensor::backend::Backend> ModuleVisitor<B> for LoraIdCollector {
 
 #[cfg(test)]
 mod lora_id_collector_tests {
-    use super::lora_module_name;
+    use super::{lora_gradient_name, lora_module_name};
 
     fn path(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_owned()).collect()
@@ -756,7 +773,7 @@ mod lora_id_collector_tests {
                 "standard",
                 "q_proj",
                 "lora_up",
-            ])),
+            ]), false),
             Some("self_attn.q_proj".to_owned())
         );
     }
@@ -764,8 +781,33 @@ mod lora_id_collector_tests {
     #[test]
     fn preserves_mlp_target_names() {
         assert_eq!(
-            lora_module_name(&path(&["blocks", "0", "mlp_layer1", "lora_down"])),
+            lora_module_name(&path(&["blocks", "0", "mlp_layer1", "lora_down"]), false),
             Some("mlp.layer1".to_owned())
+        );
+    }
+
+    #[test]
+    fn maps_llm_adapter_target_names_when_enabled() {
+        let path = path(&[
+            "llm_adapter",
+            "blocks",
+            "0",
+            "self_attn",
+            "standard",
+            "q_proj",
+            "lora_up",
+        ]);
+        assert_eq!(
+            lora_module_name(&path, false),
+            None,
+        );
+        assert_eq!(
+            lora_module_name(&path, true),
+            Some("self_attn.q_proj".to_owned())
+        );
+        assert_eq!(
+            lora_gradient_name(&path, true),
+            Some("gradient_lora_unet_llm_adapter_blocks_0_self_attn_q_proj_lora_up_weight".to_owned())
         );
     }
 }
@@ -777,6 +819,7 @@ where
 {
     let mut collector = LoraIdCollector {
         target_modules: lora.target_modules.clone(),
+        include_llm_adapter: lora.include_llm_adapter,
         ids: Vec::new(),
         path: Vec::new(),
     };
@@ -786,13 +829,21 @@ where
 
 struct LoraGradientCollector {
     target_modules: Vec<String>,
+    include_llm_adapter: bool,
     path: Vec<String>,
     parameters: Vec<(String, ParamId)>,
 }
 
-fn lora_gradient_name(path: &[String]) -> Option<String> {
-    let block = path.iter().position(|part| part == "blocks")?;
-    let mut parts = path[block..]
+fn lora_gradient_name(path: &[String], include_llm_adapter: bool) -> Option<String> {
+    let start = if path.first().map(String::as_str) == Some("llm_adapter") {
+        if !include_llm_adapter {
+            return None;
+        }
+        0
+    } else {
+        path.iter().position(|part| part == "blocks")?
+    };
+    let mut parts = path[start..]
         .iter()
         .filter(|part| part.as_str() != "standard")
         .cloned()
@@ -815,11 +866,11 @@ impl<B: burn::tensor::backend::Backend> ModuleVisitor<B> for LoraGradientCollect
     }
 
     fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
-        let Some(module) = lora_module_name(&self.path) else {
+        let Some(module) = lora_module_name(&self.path, self.include_llm_adapter) else {
             return;
         };
         if self.target_modules.iter().any(|target| target == &module) {
-            if let Some(name) = lora_gradient_name(&self.path) {
+            if let Some(name) = lora_gradient_name(&self.path, self.include_llm_adapter) {
                 self.parameters.push((name, param.id));
             }
         }
@@ -837,6 +888,7 @@ fn dump_lora_gradients<B, A>(
 {
     let mut collector = LoraGradientCollector {
         target_modules: lora.target_modules.clone(),
+        include_llm_adapter: lora.include_llm_adapter,
         path: Vec::new(),
         parameters: Vec::new(),
     };
